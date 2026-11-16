@@ -2,6 +2,24 @@ import { test, expect } from "@playwright/test";
 
 const engines = ["copilot", "claude", "codex", "gemini", "pi", "agy"];
 
+// Section ids that /reference/engines/ carried before #76704 moved those sections to per-engine pages.
+const movedSectionAnchors = [
+  "engine-environment-variables",
+  "engine-command-line-arguments",
+  "custom-engine-command",
+  "copilot-custom-configuration",
+  "copilot-release-checksum-pins",
+  "copilot-bring-your-own-key-byok-mode",
+  "azure-foundry-openai",
+  "copilot-sdk-support",
+  "sdk-driver-environment-variables",
+  "pi-extensions-extensions",
+  "claude-tool-enforcement-security-model",
+  "gateway-side-enforcement",
+  "shared-imported-engines",
+  "unsupported-engine-samples",
+];
+
 for (const engine of engines) {
   test(`${engine} landing page stays introductory and links to its reference`, async ({ page }) => {
     await page.goto(`/gh-aw/engines/${engine}/`);
@@ -35,9 +53,10 @@ test("shared reference links to per-engine contracts and preserves moved-section
     await expect(content.locator(`a[href="/gh-aw/reference/engines/${engine}/"]`).first()).toBeVisible();
   }
   await expect(content.locator("#engine-feature-comparison")).toBeVisible();
-  await expect(content.locator("#copilot-sdk-support")).toBeVisible();
-  await expect(content.locator("#claude-tool-enforcement-security-model")).toBeVisible();
-  await expect(content.locator("#pi-extensions-extensions")).toBeVisible();
+  for (const id of movedSectionAnchors) {
+    await expect(content.locator(`[id="${id}"]`), `#${id}`).toHaveCount(1);
+    await expect(content.locator(`[id="${id}"]`), `#${id}`).toBeVisible();
+  }
   await expect(content.locator('a[href="/gh-aw/reference/third-party-agent/#unsupported-engine-samples"]')).toBeVisible();
 });
 

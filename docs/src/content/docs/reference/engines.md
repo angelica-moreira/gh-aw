@@ -65,9 +65,9 @@ engine:
 | `model` | Exact model ID, alias, or provider-prefixed selection; may also be top-level `model`. |
 | `version` | Override the compiler-pinned CLI version. |
 | `cooldown` | Minimum release age in nonnegative integer days; defaults to `3`. Explicit `0` is rejected in strict mode. |
-| `env` | Engine-only runtime values; use top-level `env` for all steps. [Scope and precedence](/gh-aw/reference/environment-variables/) apply. |
-| `args` | Ordered native CLI arguments placed before the prompt. Agy rejects it. |
-| `command` | Replacement executable that skips the engine installer, not AWF installation. Provision it in setup steps; Agy checks the verified version, and Copilot checksum pins cannot be combined with it. |
+| <span id="engine-environment-variables">`env`</span> | Engine-only runtime values; use top-level `env` for all steps. [Scope and precedence](/gh-aw/reference/environment-variables/) apply. |
+| <span id="engine-command-line-arguments">`args`</span> | Ordered native CLI arguments placed before the prompt. Agy rejects it. |
+| <span id="custom-engine-command">`command`</span> | Replacement executable that skips the engine installer, not AWF installation. Provision it in setup steps; Agy checks the verified version, and Copilot checksum pins cannot be combined with it. |
 | `api-target` | Endpoint hostname, where supported; see below. |
 | `harness` | Replacement wrapper or retry settings for Copilot, Claude, and Codex. |
 | `durable` | Artifact-backed session continuation with optional `retention-days` (1–90, default `7`). |
@@ -274,7 +274,7 @@ These tests do not establish security, model quality, SDK/driver coverage, or pr
 
 The following anchors retain links to sections moved from this page.
 
-- Copilot custom agents, release integrity, BYOK, and SDK: see the [Copilot reference](/gh-aw/reference/engines/copilot/#copilot-custom-configuration), including [checksum pins](/gh-aw/reference/engines/copilot/#copilot-release-checksum-pins), [BYOK](/gh-aw/reference/engines/copilot/#copilot-bring-your-own-key-byok-mode), and [SDK support](/gh-aw/reference/engines/copilot/#copilot-sdk-support).
-- Pi `extensions`: [Pi packages](/gh-aw/reference/engines/pi/#pi-extensions-extensions).
-- Claude tool enforcement: [Claude permissions and gateway enforcement](/gh-aw/reference/engines/claude/#claude-tool-enforcement-security-model).
-- Shared imported engines and samples: [Custom AI engines](/gh-aw/reference/third-party-agent/#shared-imported-engines) and [third-party samples](/gh-aw/reference/third-party-agent/#unsupported-engine-samples), including the experimental Atomic and mini-SWE-agent declarative engines.
+- Copilot custom agents, release integrity, BYOK, and SDK: see the [<span id="copilot-custom-configuration">Copilot reference</span>](/gh-aw/reference/engines/copilot/#copilot-custom-configuration), including [<span id="copilot-release-checksum-pins">checksum pins</span>](/gh-aw/reference/engines/copilot/#copilot-release-checksum-pins), [<span id="copilot-bring-your-own-key-byok-mode">BYOK</span>](/gh-aw/reference/engines/copilot/#copilot-bring-your-own-key-byok-mode) with [<span id="azure-foundry-openai">Azure Foundry OpenAI</span>](/gh-aw/reference/engines/copilot/#azure-foundry-openai), and [<span id="copilot-sdk-support">SDK support</span>](/gh-aw/reference/engines/copilot/#copilot-sdk-support) with [<span id="sdk-driver-environment-variables">SDK driver environment variables</span>](/gh-aw/reference/engines/copilot/#sdk-driver-environment-variables).
+- Pi `extensions`: [<span id="pi-extensions-extensions">Pi packages</span>](/gh-aw/reference/engines/pi/#pi-extensions-extensions).
+- Claude tool enforcement: [<span id="claude-tool-enforcement-security-model">Claude permissions</span>](/gh-aw/reference/engines/claude/#claude-tool-enforcement-security-model) and [<span id="gateway-side-enforcement">gateway enforcement</span>](/gh-aw/reference/engines/claude/#gateway-side-enforcement).
+- Shared imported engines and samples: [<span id="shared-imported-engines">Custom AI engines</span>](/gh-aw/reference/third-party-agent/#shared-imported-engines) and [<span id="unsupported-engine-samples">third-party samples</span>](/gh-aw/reference/third-party-agent/#unsupported-engine-samples), including the experimental Atomic and mini-SWE-agent declarative engines.
