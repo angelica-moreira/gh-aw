@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
+import { expectedClipboardText, grantClipboard, readClipboard } from "./helpers/clipboard";
+import { openWithCopyTarget, previewOrigin, startLocalServer, type LocalServer } from "./helpers/local-server";
 
 const pages = [
   { route: "/gh-aw/setup/working-with-workflows/", count: 2 },
@@ -42,14 +45,25 @@ for (const width of [390, 1280, 1920]) {
   }
 }
 
-test("aligned debug button still copies the fetched instructions", async ({ page, context }) => {
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-  const instructions = "# Debug instructions\nInspect the failed workflow run.";
-  await page.route("https://raw.githubusercontent.com/github/gh-aw/main/debug.md", route => route.fulfill({ status: 200, contentType: "text/plain", body: instructions }));
-  await page.goto("/gh-aw/setup/working-with-workflows/");
+test.describe("aligned debug button", () => {
+  const DEBUG_URL = "https://raw.githubusercontent.com/github/gh-aw/main/debug.md";
+  const instructions = readFileSync(new URL("../../debug.md", import.meta.url), "utf8");
+  let server: LocalServer;
 
-  const button = page.locator('.copy-entire-file-btn[data-filepath$="/debug.md"]');
-  await button.click();
-  await expect(button).toContainText("Copied!");
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(instructions);
+  test.beforeAll(async ({}, testInfo) => {
+    server = await startLocalServer(previewOrigin(testInfo), { "/debug.md": () => ({ status: 200, body: instructions }) });
+  });
+
+  test.afterAll(async () => {
+    await server?.close();
+  });
+
+  test("still copies the fetched instructions", async ({ page, context }) => {
+    await grantClipboard(context);
+    const button = await openWithCopyTarget(page, "/gh-aw/setup/working-with-workflows/", DEBUG_URL, server.url("/debug.md"));
+    await button.click();
+    await expect(button).toContainText("Copied!");
+    expect(server.hits("/debug.md")).toBe(1);
+    expect(await readClipboard(page)).toBe(expectedClipboardText(instructions));
+  });
 });

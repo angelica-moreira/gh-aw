@@ -201,6 +201,16 @@ for docs pages. Blog pages get their `BlogPosting` and breadcrumbs from
 `starlight-blog`; do not add another `BlogPosting`. `CustomHead.astro` only adds
 the site `publisher` and a `dateModified` fallback to the plugin's one.
 
+## Playwright tests
+
+Specs that read the system clipboard (`copy-button`, `copy-button-layout`,
+`heading-links`, `homepage-links`) run in the `clipboard` project, one at a
+time, because the OS clipboard is shared. Add new clipboard specs to
+`clipboardSpecs` in `playwright.config.ts`, and use `tests/helpers/clipboard.ts`
+for expected text (Chromium on Windows returns CRLF line endings). Tests serve
+fetched files from a local HTTP server (`tests/helpers/local-server.ts`) rather
+than intercepting requests.
+
 ## ⚠️ Known Dev-Mode Limitations
 
 ### Sitemap behavior in dev and production
