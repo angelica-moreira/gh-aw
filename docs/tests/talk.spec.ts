@@ -1,5 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 import { readFileSync, readdirSync } from "node:fs";
+import { sep } from "node:path";
 import { injectSlideMetadata, loadSlides, parseSlides, serializeJsonLd, slideParts } from "../src/lib/cracktro/slides.js";
 
 // The ordered slide list lives in .github/skills/cracktro/slides.md; a slide's number is its row position.
@@ -24,6 +25,8 @@ const HANDOFFS = slideNo("Event-driven Hand-offs");
 test.use({ reducedMotion: "reduce" });
 
 test("presents the slides listed in slides.md in bands without the removed sections", async ({ page }) => {
+  // clicks through every slide, so the budget grows with the deck
+  test.slow();
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
   await page.emulateMedia({ reducedMotion: "no-preference" });
@@ -374,9 +377,12 @@ test("publishes a social card for link previews", async ({ page, request }) => {
 });
 
 test("publishes synthetic examples without profile assets or private source references", async ({ page, request }) => {
+  // clicks through every illustrative slide, so the budget grows with the deck
+  test.slow();
   const allowedAvatar = /^assets\/avatars\/(?:mona\.jpg|ducky\.jpg|mona-full\.png)$/;
   for (const asset of readdirSync(new URL("../public/cracktro/assets/", import.meta.url), { recursive: true }) as string[]) {
-    expect(asset === "avatars" || allowedAvatar.test(`assets/${asset}`), asset).toBe(true);
+    // readdirSync returns native separators; normalise them so the check also runs on Windows
+    expect(asset === "avatars" || allowedAvatar.test(`assets/${asset.split(sep).join("/")}`), asset).toBe(true);
   }
   const source = await (await request.get("/gh-aw/cracktro/deck.js")).text();
   expect(source.match(/\bwho:\s|(?<![.\w])github(?:next)?\/(?!squad\b)[\w.-]+|\b[a-f0-9]{40}\b/i)).toBeNull();
@@ -411,6 +417,8 @@ test("publishes synthetic examples without profile assets or private source refe
 });
 
 test("keeps role and avatar circles flat", async ({ page }) => {
+  // clicks through every slide, so the budget grows with the deck
+  test.slow();
   await page.goto("/gh-aw/cracktro/");
   for (const index of SLIDES.keys()) {
     await page.getByRole("button", { name: `Slide ${index + 1}`, exact: true }).click();
@@ -442,7 +450,10 @@ test.describe("agentic engineering slides", () => {
   const open = async (page: Page, heading: string, ms: number) => {
     const errors: string[] = [];
     page.on("pageerror", error => errors.push(error.message));
-    await page.clock.install();
+    // Pause the clock so only the test advances it: under load, real time would otherwise
+    // run the looping timelines past the asserted state into their next cycle.
+    await page.clock.install({ time: 0 });
+    await page.clock.pauseAt(1000);
     await page.goto(`/gh-aw/cracktro/#${slideNo(heading)}`);
     await expect(page.locator(".slide.active h2")).toHaveText(heading);
     // Slide timelines derive state from elapsed time, so jumping ahead is equivalent to waiting.
