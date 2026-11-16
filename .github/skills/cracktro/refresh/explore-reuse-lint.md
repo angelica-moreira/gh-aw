@@ -111,7 +111,7 @@ Sanity baseline (2026-11-14):
 - Run `node --check docs/public/cracktro/deck.js`.
 - Preview the slide: run `python3 -m http.server 4331 --bind 127.0.0.1 --directory docs/public` (async), open `http://127.0.0.1:4331/cracktro/#<n>` in the browser canvas (the slide number shifts, so find it with the dots), and take a screenshot. Check that nothing overlaps and that the bars fit in 0–150 px (`v*12`; rescale if any value is over 12).
 - Content rules: no 40-hex SHAs (branch suffixes are 16-hex, but do not render branches), no URLs, no `github/<repo>` strings in `deck.js`, and only agent names (Sergo, Copilot), never people.
-- Run `cd docs && npx playwright test tests/talk.spec.ts`. If the hardcoded chromium path or `AGENTICS_WORKFLOWS_DIR` blocks it, use a local config, or say the tests were not run.
+- Run `cd docs && npx playwright test tests/talk.spec.ts`. If `AGENTICS_WORKFLOWS_DIR` blocks it, set it (see `../SKILL.md`), or say the tests were not run.
 - Stop the preview server.
 
 ## 7. Pitfalls

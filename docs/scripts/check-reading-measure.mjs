@@ -4,7 +4,7 @@
 // change them there first, with the designer's agreement, then update this file.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const docsDir = fileURLToPath(new URL("..", import.meta.url));
@@ -30,7 +30,7 @@ const files = [...walk(join(docsDir, "src")), join(docsDir, "astro.config.mjs")]
 const declaration = new RegExp(`(${Object.keys(expected).join("|")})\\s*:\\s*([^;}"'\`]+)`, "g");
 
 for (const file of files) {
-  const rel = relative(docsDir, file);
+  const rel = relative(docsDir, file).split(sep).join("/");
   for (const [, name, rawValue] of readFileSync(file, "utf8").matchAll(declaration)) {
     const value = rawValue.replace(/\/\*.*?\*\//g, "").trim();
     if (rel !== tokensFile) {

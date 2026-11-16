@@ -97,4 +97,4 @@ After each edit:
 
 ## Tests
 
-Run from `docs/` after `npm ci`: `npx playwright test tests/talk.spec.ts`. The config builds and previews the site (`npm run build && npm run preview`, `localhost:4321`, `/gh-aw/cracktro/`, Chromium at `/usr/bin/chromium-browser`), so it covers the built JSON-LD, not dev; under `npm run dev`, check `curl -s localhost:4321/gh-aw/cracktro/ | grep hasPart`. If `node_modules` is missing, report the tests as not run.
+Run from `docs/` after `npm ci`: `npx playwright test tests/talk.spec.ts`. The config builds and previews the site (`npm run build && npm run preview`, `localhost:4321`, `/gh-aw/cracktro/`; Chromium at `/usr/bin/chromium-browser` when present, else Playwright's bundled one from `npx playwright install chromium`), so it covers the built JSON-LD, not dev; under `npm run dev`, check `curl -s localhost:4321/gh-aw/cracktro/ | grep hasPart`. The build needs `githubnext/agentics` checked out beside the repo, or `AGENTICS_WORKFLOWS_DIR` pointing at its `workflows/`. If `node_modules` is missing, report the tests as not run.

@@ -1,8 +1,17 @@
 import { defineConfig, devices } from '@playwright/test';
+import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const configDir = dirname(fileURLToPath(import.meta.url));
+// Use the system Chromium where it is installed (CI); elsewhere fall back to
+// Playwright's bundled browser (`npx playwright install chromium`).
+const systemChromium = '/usr/bin/chromium-browser';
+
+const chromiumUse = {
+  ...devices['Desktop Chrome'],
+  launchOptions: existsSync(systemChromium) ? { executablePath: systemChromium } : {},
+};
 
 /**
  * See https://playwright.dev/docs/test-configuration.
@@ -31,12 +40,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: {
-        ...devices['Desktop Chrome'],
-        launchOptions: {
-          executablePath: '/usr/bin/chromium-browser',
-        },
-      },
+      use: chromiumUse,
     },
   ],
 
