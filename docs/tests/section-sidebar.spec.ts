@@ -152,9 +152,15 @@ test("Workshop lives under Guides and retains its curriculum links", async ({ pa
 });
 
 test("the old Workshop URL redirects to Guides and preserves bookmarks", async ({ page }) => {
-  await page.goto("/gh-aw/workshop/#j=terminal&s=daily-status&t=00-welcome");
-  await expect(page).toHaveURL(/\/gh-aw\/guides\/workshop\/#j=terminal&s=daily-status&t=00-welcome$/);
+  await page.goto("/gh-aw/workshop/#x");
+  await expect(page).toHaveURL(/\/gh-aw\/guides\/workshop\/#x$/);
   await expect(page.getByRole("heading", { name: "Workshop", exact: true })).toBeVisible();
+});
+
+test("a redirect's own fragment wins over the requested one", async ({ page }) => {
+  await page.goto("/gh-aw/reference/servicenow-connector/#other");
+  await expect(page).toHaveURL(/\/gh-aw\/reference\/connectors\/#servicenow$/);
+  await expect(page.locator("#servicenow")).toBeVisible();
 });
 
 for (const guide of [

@@ -178,6 +178,22 @@ Code in the expanded view is editable as plain text for live demonstrations.
 Edits affect only the expanded copy and are discarded when it closes; opening
 the snippet again restores its original contents.
 
+## Redirects
+
+Moved pages keep their old URLs through the `redirects` map in
+`astro.config.mjs`. Entries must be static string redirects
+(`"/old/": "/gh-aw/new/"` or `"/old/": "/gh-aw/new/#section"`) to a docs page
+(checked by `scripts/check-redirects.mjs`) or an absolute `http(s)` URL.
+Object-form, dynamic (`[param]`) or protocol-relative redirects, and destinations
+with whitespace, control characters or backslashes, fail the build.
+
+Astro builds each redirect as a meta-refresh page, which on its own drops the
+`#fragment`. `src/lib/redirect-fragments.js` adds a script to every redirect
+page so `/gh-aw/old/#section` lands on `/gh-aw/new/#section`. A fragment in the
+destination wins over the incoming one. Without JavaScript, the meta refresh
+still redirects but the incoming fragment is lost. Unit tests:
+`node --test src/lib/redirect-fragments.test.js`.
+
 ## ⚠️ Known Dev-Mode Limitations
 
 ### Sitemap behavior in dev and production
