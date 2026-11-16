@@ -235,6 +235,8 @@ test("walks a pattern's column of examples with up/down and hints at it from the
   await expect(count).toHaveAttribute("aria-label", at(head));
   // past the bottom of the column, Down moves on to the next band (trust the process)
   await page.goto(`/gh-aw/cracktro/#${last}`);
+  // a hash-only goto returns before the deck handles hashchange, so wait for it to land first
+  await expect(count).toHaveAttribute("aria-label", at(last));
   await page.keyboard.press("ArrowDown");
   await expect(count).toHaveAttribute("aria-label", at(slideNo("For PMs") + 1));
 });
