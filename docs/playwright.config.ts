@@ -13,6 +13,11 @@ const chromiumUse = {
   launchOptions: existsSync(systemChromium) ? { executablePath: systemChromium } : {},
 };
 
+// Specs that write to and read the system clipboard (see the 'clipboard' project).
+const clipboardSpecs = ['copy-button', 'copy-button-layout', 'heading-links', 'homepage-links'].map(
+  (name) => `**/${name}.spec.ts`,
+);
+
 /**
  * See https://playwright.dev/docs/test-configuration.
  */
@@ -41,6 +46,16 @@ export default defineConfig({
     {
       name: 'chromium',
       use: chromiumUse,
+      testIgnore: clipboardSpecs,
+    },
+    {
+      // The OS clipboard is shared by every browser, so specs that read it run
+      // one at a time in their own project.
+      name: 'clipboard',
+      use: chromiumUse,
+      testMatch: clipboardSpecs,
+      fullyParallel: false,
+      workers: 1,
     },
   ],
 
