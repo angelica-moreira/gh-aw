@@ -1,33 +1,27 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from '@playwright/test';
+import { entitiesOfType, jsonLdEntities, type JsonLdEntity } from './helpers/json-ld';
 
-async function getJsonLd(page: Page) {
-  const jsonLd = page.locator('script[type="application/ld+json"]');
-  await expect(jsonLd).toHaveCount(1);
+async function loadEntities(page: Page, path: string) {
+  await page.goto(path);
+  await page.waitForLoadState('networkidle');
+  return jsonLdEntities(page);
+}
 
-  const raw = await jsonLd.first().textContent();
-  if (!raw) {
-    throw new Error('Expected JSON-LD script content');
-  }
-
-  return JSON.parse(raw);
+function onlyEntity(entities: JsonLdEntity[], type: string): JsonLdEntity {
+  const matches = entitiesOfType(entities, type);
+  expect(matches, `${type} entities`).toHaveLength(1);
+  return matches[0];
 }
 
 test.describe('Schema JSON-LD', () => {
   test('keeps homepage website schema intact', async ({ page }) => {
-    await page.goto('/gh-aw/');
-    await page.waitForLoadState('networkidle');
+    const entities = await loadEntities(page, '/gh-aw/');
 
-    const schema = await getJsonLd(page);
-    const graphTypes = schema['@graph'].map((item: { '@type': string }) => item['@type']);
-    const website = schema['@graph'].find((item: { '@type': string }) => item['@type'] === 'WebSite');
-    const organization = schema['@graph'].find((item: { '@type': string }) => item['@type'] === 'Organization');
+    const website = onlyEntity(entities, 'WebSite');
+    const organization = onlyEntity(entities, 'Organization');
+    onlyEntity(entities, 'FAQPage');
 
-    expect(graphTypes).toContain('WebSite');
-    expect(graphTypes).toContain('Organization');
-    expect(graphTypes).toContain('FAQPage');
-    expect(website).toBeDefined();
-    expect(organization).toBeDefined();
     expect(website.name).toBe('gh-aw — GitHub Agentic Workflows');
     expect(website.url).toBe('https://github.github.com/gh-aw/');
     expect(organization.name).toBe('GitHub');
@@ -40,45 +34,41 @@ test.describe('Schema JSON-LD', () => {
     );
   });
 
-  test('adds BlogPosting schema to blog posts', async ({ page }) => {
-    await page.goto('/gh-aw/blog/2026-01-13-meet-the-workflows-testing-validation/');
-    await page.waitForLoadState('networkidle');
+  test('blog posts carry a single BlogPosting from starlight-blog', async ({ page }) => {
+    const postUrl = 'https://github.github.com/gh-aw/blog/2026-01-13-meet-the-workflows-testing-validation/';
+    const entities = await loadEntities(page, '/gh-aw/blog/2026-01-13-meet-the-workflows-testing-validation/');
 
-    const schema = await getJsonLd(page);
-
-    expect(schema['@type']).toBe('BlogPosting');
-    expect(typeof schema.headline).toBe('string');
-    expect(schema.headline.length).toBeGreaterThan(0);
-    expect(typeof schema.description).toBe('string');
-    expect(schema.description.length).toBeGreaterThan(0);
-    expect(typeof schema.url).toBe('string');
-    expect(schema.url).toContain(
-      '/gh-aw/blog/2026-01-13-meet-the-workflows-testing-validation/'
-    );
-    expect(schema.datePublished).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    expect(schema.dateModified).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-    expect(schema.author).toEqual(
+    const post = onlyEntity(entities, 'BlogPosting');
+    expect(post.headline).toBe('Meet the Workflows: Testing & Validation');
+    expect(post.description, 'non-empty string description').toMatch(/\S/);
+    expect(post.url).toBe(postUrl);
+    expect(post.mainEntityOfPage).toBe(postUrl);
+    expect(post.datePublished).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(post.dateModified).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(post.publisher).toEqual({ '@id': 'https://github.github.com/gh-aw/#organization' });
+    expect(post.isPartOf).toMatchObject({ '@type': 'Blog', url: 'https://github.github.com/gh-aw/blog/' });
+    expect(post.author).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ '@type': 'Person' }),
+        expect.objectContaining({ '@type': 'Person', name: 'Don Syme' }),
       ])
     );
-    expect(schema.publisher).toEqual({
-      '@id': 'https://github.github.com/gh-aw/#organization',
-    });
+    onlyEntity(entities, 'BreadcrumbList');
+    expect(entitiesOfType(entities, 'TechArticle')).toHaveLength(0);
   });
 
   test('adds TechArticle schema to inner docs pages', async ({ page }) => {
-    await page.goto('/gh-aw/setup/quick-start/');
-    await page.waitForLoadState('networkidle');
+    const entities = await loadEntities(page, '/gh-aw/setup/quick-start/');
 
-    const schema = await getJsonLd(page);
-
-    expect(schema['@type']).toBe('TechArticle');
-    expect(schema.headline).toBe('Quick Start');
-    expect(schema.description).toContain('Get your first agentic workflow running in minutes.');
-    expect(schema.url).toBe('https://github.github.com/gh-aw/setup/quick-start/');
-    expect(schema.isPartOf).toEqual({
+    const article = onlyEntity(entities, 'TechArticle');
+    expect(article.headline).toBe('GitHub Agentic Workflows Quickstart');
+    expect(article.description).toBe(
+      'Install GitHub Agentic Workflows (gh-aw), choose an AI engine, add a Markdown workflow, and run an AI agent through GitHub Actions.'
+    );
+    expect(article.url).toBe('https://github.github.com/gh-aw/setup/quick-start/');
+    expect(article.isPartOf).toEqual({
       '@id': 'https://github.github.com/gh-aw/#website',
     });
+    // The page's own HowTo (in its frontmatter head) is intentional.
+    onlyEntity(entities, 'HowTo');
   });
 });

@@ -194,6 +194,13 @@ destination wins over the incoming one. Without JavaScript, the meta refresh
 still redirects but the incoming fragment is lost. Unit tests:
 `node --test src/lib/redirect-fragments.test.js`.
 
+## Structured data
+
+`src/components/CustomHead.astro` emits the homepage graph and a `TechArticle`
+for docs pages. Blog pages get their `BlogPosting` and breadcrumbs from
+`starlight-blog`; do not add another `BlogPosting`. `CustomHead.astro` only adds
+the site `publisher` and a `dateModified` fallback to the plugin's one.
+
 ## ⚠️ Known Dev-Mode Limitations
 
 ### Sitemap behavior in dev and production
