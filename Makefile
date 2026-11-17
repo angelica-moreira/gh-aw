@@ -561,6 +561,7 @@ test-scripts: build test-workflow-tool-contracts test-agent-local-settings test-
 	node --test scripts/release-workflows.test.cjs
 	node --test scripts/maintenance-workflows.test.cjs
 	node --test scripts/auditor-workflow.test.cjs
+	node --test scripts/prove-it/prove-it.test.mjs
 	bash scripts/extract-workflow-frontmatter-keys_test.sh
 	bash scripts/check-stale-lock-files_test.sh
 	$(MAKE) --no-print-directory test-agent-dev-loop
