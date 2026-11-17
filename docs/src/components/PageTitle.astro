@@ -1,9 +1,8 @@
 ---
-import Default from '@astrojs/starlight/components/PageTitle.astro';
-
 // The landing page (route id '') supplies its own h1, the hero headline,
 // so skip Starlight's page title there.
 const isLanding = Astro.locals.starlightRoute.id === '';
+const title = Astro.locals.starlightRoute.entry.data.title;
 ---
 
-{isLanding ? null : <Default {...Astro.props} />}
+{isLanding ? null : <h1 id="_top" set:html={title} />}
