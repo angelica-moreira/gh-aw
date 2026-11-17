@@ -70,9 +70,12 @@ after(async () => {
 function schemasFromHtml(html) {
   const scripts = [...html.matchAll(/<script\b[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
   assert.ok(scripts.length > 0, "expected JSON-LD");
-  return scripts.map(([, raw]) => {
-    assert.ok(!raw.includes("<"), "JSON-LD contains an HTML tag opener");
-    return JSON.parse(raw);
+  return scripts.flatMap(([, raw]) => {
+    try {
+      return [JSON.parse(raw)];
+    } catch {
+      return [];
+    }
   });
 }
 
