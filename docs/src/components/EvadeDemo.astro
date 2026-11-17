@@ -1,0 +1,14 @@
+---
+import { escapeNothing } from '../lib/evade-demo.js';
+import { escapeJsonLd } from '../lib/json-ld.js';
+const { raw } = Astro.props;
+---
+<script type="application/ld+json" set:html={JSON.stringify(raw)} />
+<div set:html={raw} />
+<script type="application/ld+json" set:html={
+  JSON.stringify(raw)
+} />
+{/* note */}<script type="application/ld+json" set:html={JSON.stringify(raw)} />
+<script type="application/ld+json" set:html={escapeNothing(JSON.stringify(raw))} />
+<script type="application/ld+json" set:html={escapeJsonLd("") + JSON.stringify(raw)} />
+<script type="application/ld+json" set:html={JSON.stringify(raw).replace(/</g, "<")} />
