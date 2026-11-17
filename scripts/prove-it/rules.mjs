@@ -103,7 +103,7 @@ export function scanFrontmatter(file, content) {
     .map(added => finding("frontmatter", "medium", file.path, added.line, "frontmatter holds HTML or script text that ends up in page metadata."));
 }
 
-/** Names exported by `export function escapeX|sanitizeX|serializeX` lines from `git grep -n`. */
+/** Names of exported escape*, sanitize* and serialize* functions in `git grep -n` output. */
 export function parseSanitizers(grepOutput) {
   const names = [...grepOutput.matchAll(/export\s+(?:async\s+)?function\s+((?:escape|sanitize|serialize)\w*)/g)].map(m => m[1]);
   return new Set(names);
