@@ -5,9 +5,11 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { join, relative } from "node:path";
 import { serve, withBrowser } from "./browser.mjs";
 import { blankComments, blankStrings, matchClose } from "./lex.mjs";
+import { moduleAgrees } from "./parse.mjs";
 import { runNode } from "./sandbox.mjs";
 
-const FIELDS = ["title", "description"];
+// Page fields that get an attack string, and how each is written in frontmatter.
+const FIELDS = { title: p => p, description: p => p, sidebar: p => ({ label: p }) };
 const CONTROL_TITLE = "Ordinary control title";
 const BUILD_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SITE = { site: "https://localhost", base: "/" };
@@ -20,10 +22,19 @@ export function newMarker() {
 /**
  * Attack strings that set the marker when they run as script. The bare name starts the script, so
  * it stays inside Chromium's 40-character CSP sample, and page code cannot shadow a name it does not know.
+ * They break out of a script block, a double- or single-quoted attribute, and plain text, and two
+ * are mutation XSS forms that only run after the browser re-parses markup that looked safe.
  */
 export function payloads(marker) {
   const mark = `${marker}=1`;
-  return [`</ScRiPt><script>${mark}</script><!--`, `"><img src=x onerror="${mark}">`, `<svg/onload=${mark}>`];
+  return [
+    `</ScRiPt><script>${mark}</script><!--`,
+    `"><img src=x onerror="${mark}">`,
+    `<svg/onload=${mark}>`,
+    `'><svg onload=${mark}>`,
+    `<noscript><p title="</noscript><img src=x onerror=${mark}>">`,
+    `<math><mtext><table><mglyph><style><img src=x onerror=${mark}>`,
+  ];
 }
 
 const OVERRIDE = /^\s*(\w+)\s*:\s*(["'])([^"'`\n]+)\2\s*$/;
@@ -104,8 +115,8 @@ export function probePages(marker) {
   const pages = [{ file: "index.md", text: page({ title: CONTROL_TITLE }) }];
   const slug = marker.slice(-6);
   payloads(marker).forEach((payload, i) => {
-    for (const field of FIELDS) {
-      const data = { title: "Ordinary title", description: "Ordinary description", [field]: payload };
+    for (const [field, value] of Object.entries(FIELDS)) {
+      const data = { title: "Ordinary title", description: "Ordinary description", [field]: value(payload) };
       pages.push({ file: `${slug}${i}-${field}.md`, text: page(data) });
       pages.push({ file: `blog/${slug}${i}-${field}.md`, text: page({ ...data, date: "2026-01-13", authors: [`a${i}`], tags: [payload] }) });
     }
@@ -190,8 +201,10 @@ function absoluteComponents(docsDir, components) {
  * Runs the proof for one checked-out docs folder. Base and head get the same marker, so page
  * names (which contain it) line up. Playwright is loaded from the trusted `nodeModules`.
  */
-export async function prove({ docsDir, marker, nodeModules, sandbox }) {
-  const configText = blankComments(await readFile(join(docsDir, "astro.config.mjs"), "utf8"));
+export async function prove({ docsDir, marker, nodeModules, sandbox, parser }) {
+  const rawConfig = await readFile(join(docsDir, "astro.config.mjs"), "utf8");
+  if (!moduleAgrees(rawConfig, "astro.config.mjs", parser)) return { verdict: "inconclusive", reason: "the gate's lexer and a JavaScript parser read docs/astro.config.mjs differently" };
+  const configText = blankComments(rawConfig);
   if (configText === null) return { verdict: "inconclusive", reason: "docs/astro.config.mjs could not be read as code" };
   const components = findComponents(configText);
   if (!components) return { verdict: "inconclusive", reason: "docs/astro.config.mjs must name `components` once, as an object of plain `Name: \"path\"` entries" };

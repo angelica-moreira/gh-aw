@@ -10,7 +10,25 @@ const MAX_REPORT_BYTES = 64 * 1024;
 
 // Report-only: nothing is blocked, but Chromium itself reports every inline script and event
 // handler about to run, with its first 40 characters. Page code cannot stop these reports.
-export const CSP = `script-src 'self' 'report-sample'; report-uri ${REPORT_PATH}`;
+// The Trusted Types directive makes Chromium pass every HTML write to the default policy.
+export const CSP = `script-src 'self' 'report-sample'; require-trusted-types-for 'script'; report-uri ${REPORT_PATH}`;
+const TT_DIRECTIVE = "require-trusted-types-for";
+const MAX_SINK_CHARS = 80;
+
+// Runs before page scripts and claims the only `default` Trusted Types policy, so page code
+// cannot replace it. It records HTML writes that hold the marker and returns them unchanged.
+// Page code can still skip it with its own named policy, so these writes only ever warn.
+export const WRITE_RECORDER = ({ marker, binding }) => {
+  const report = globalThis[binding];
+  const tt = globalThis.trustedTypes;
+  if (!tt) return;
+  const pass = value => value;
+  const createHTML = (value, type, sink) => {
+    if (String(value).includes(marker)) report(String(sink));
+    return value;
+  };
+  tt.createPolicy("default", { createHTML, createScript: pass, createScriptURL: pass });
+};
 
 // Runs before page scripts. The marker property cannot be redefined, and each hit is also sent
 // to Node through a binding captured here. Built-ins are captured too, and the hit is counted
@@ -65,8 +83,9 @@ async function respond(res, file) {
 const isOptional = (value, type) => value === undefined || typeof value === type;
 
 // Keeps only the fields takeReports reads, and only when they have the types Chromium sends.
+// Trusted Types reports describe HTML writes, not scripts about to run, so they are dropped.
 function validReport(report) {
-  if (typeof report?.["document-uri"] !== "string") return null;
+  if (typeof report?.["document-uri"] !== "string" || report["effective-directive"] === TT_DIRECTIVE) return null;
   const { "document-uri": uri, "script-sample": sample, "line-number": line, "column-number": column } = report;
   if (!isOptional(sample, "string") || !isOptional(line, "number") || !isOptional(column, "number")) return null;
   return { "document-uri": uri, "script-sample": sample, "line-number": line, "column-number": column };
@@ -137,7 +156,7 @@ function readPage(marker) {
 
 const SETTLE_MS = 500;
 
-async function visit(context, url, { marker, hits, reports }) {
+async function visit(context, url, { marker, hits, writes, reports }) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "load", timeout: 30_000 });
@@ -145,12 +164,18 @@ async function visit(context, url, { marker, hits, reports }) {
     const seen = await page.evaluate(readPage, marker);
     const where = hits.get(page) ?? [];
     const reported = takeReports(reports, page.url(), marker);
-    return { ...seen, runs: Math.max(seen.runs, where.length, reported.length), recorded: where.length, reported: reported.length, where: where.length ? where : reported };
+    const sinks = writes.get(page) ?? [];
+    const runs = Math.max(seen.runs, where.length, reported.length);
+    return { ...seen, runs, recorded: where.length, reported: reported.length, where: where.length ? where : reported, writes: sinks.length, sinks: [...new Set(sinks)] };
   } finally {
     await page.close();
     hits.delete(page);
+    writes.delete(page);
   }
 }
+
+/** Gives page code a binding that appends what it is called with to `store`, per page. */
+const recordInto = (store, limit) => ({ page }, value) => store.set(page, [...(store.get(page) ?? []), String(value).slice(0, limit)]);
 
 /** Opens Chromium with the recorder installed and gives `fn` a `visit(url)` helper. */
 export async function withBrowser({ nodeModules, origin, marker, reports }, fn) {
@@ -158,12 +183,14 @@ export async function withBrowser({ nodeModules, origin, marker, reports }, fn) 
   const browser = await chromium.launch();
   try {
     const context = await browser.newContext();
-    const binding = `${marker}r`;
     const hits = new Map();
-    await context.exposeBinding(binding, ({ page }, site) => hits.set(page, [...(hits.get(page) ?? []), String(site)]));
-    await context.addInitScript(RECORDER, { marker, binding });
+    const writes = new Map();
+    await context.exposeBinding(`${marker}r`, recordInto(hits, Infinity));
+    await context.exposeBinding(`${marker}w`, recordInto(writes, MAX_SINK_CHARS));
+    await context.addInitScript(RECORDER, { marker, binding: `${marker}r` });
+    await context.addInitScript(WRITE_RECORDER, { marker, binding: `${marker}w` });
     await context.route("**/*", route => (route.request().url().startsWith(origin) ? route.continue() : route.abort()));
-    return await fn(url => visit(context, url, { marker, hits, reports }));
+    return await fn(url => visit(context, url, { marker, hits, writes, reports }));
   } finally {
     await browser.close();
   }

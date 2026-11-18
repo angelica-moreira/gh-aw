@@ -1,10 +1,12 @@
 // Test gate: runs the docs node tests at base and head and compares results per test.
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { runNode } from "./sandbox.mjs";
 
 // Passed inline as a data: URL, so the run needs no file from the gate folder and cannot swap it.
 const REPORTER = `data:text/javascript;base64,${readFileSync(new URL("./reporter.mjs", import.meta.url)).toString("base64")}`;
+const SIGNED = /^([0-9a-f]{64}) (\{.*\})$/;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 export const RERUNS = 5;
 
@@ -38,15 +40,31 @@ export function useBaseTests(baseDocs, headDocs) {
 }
 
 /**
- * Parses reporter output into a map of "file > suite > name" to "pass" | "fail" | "skip" | "todo".
+ * The records the reporter signed with `key`, in order, without the end record. Null when a signed
+ * line does not verify, a record is missing or out of order, or the run stopped before the end record.
+ */
+export function verifiedRecords(stdout, key) {
+  const records = [];
+  for (const line of stdout.split("\n")) {
+    const m = SIGNED.exec(line);
+    if (!m) continue;
+    const mac = createHmac("sha256", key).update(m[2]).digest();
+    if (!timingSafeEqual(mac, Buffer.from(m[1], "hex"))) return null;
+    const record = JSON.parse(m[2]);
+    if (record.seq !== records.length) return null;
+    records.push(record);
+  }
+  return records.at(-1)?.end === true ? records.slice(0, -1) : null;
+}
+
+/**
+ * Turns reporter records into a map of "file > suite > name" to "pass" | "fail" | "skip" | "todo".
  * Repeated names get " #2", " #3", ... in run order.
  */
-export function parseResults(stdout, docsDir) {
+export function parseResults(records, docsDir) {
   const results = new Map();
   const seen = new Map();
-  for (const line of stdout.split("\n")) {
-    if (!line.startsWith("{")) continue;
-    const { status, name, file } = JSON.parse(line);
+  for (const { status, name, file } of records) {
     const base = `${relative(docsDir, file).replaceAll("\\", "/")} > ${name}`;
     const count = (seen.get(base) ?? 0) + 1;
     seen.set(base, count);
@@ -61,12 +79,17 @@ export function runCrashed(run, results) {
   return run.status !== 0 && ![...results.values()].includes("fail");
 }
 
+const UNSIGNED = "\nThe results were incomplete or not all signed by the gate's reporter, so the run counts as crashed.";
+
 export function runTests(docsDir, files, sandbox) {
   if (files.length === 0) return { results: new Map(), exitCode: 0, crashed: false, log: "" };
-  const args = ["--test", "--test-concurrency=1", `--test-reporter=${REPORTER}`, ...files];
-  const run = runNode(args, { cwd: docsDir, sandbox, timeoutMs: TEST_TIMEOUT_MS });
-  const results = parseResults(run.stdout ?? "", docsDir);
-  return { results, exitCode: run.status, crashed: runCrashed(run, results), log: `${run.stderr ?? ""}${run.error ? String(run.error) : ""}`.slice(-4000) };
+  const key = randomBytes(32);
+  const args = ["--test", "--test-isolation=process", "--test-concurrency=1", `--test-reporter=${REPORTER}`, ...files];
+  const run = runNode(args, { cwd: docsDir, sandbox, timeoutMs: TEST_TIMEOUT_MS, input: key });
+  const records = verifiedRecords(run.stdout ?? "", key);
+  const results = parseResults(records ?? [], docsDir);
+  const log = `${run.stderr ?? ""}${run.error ? String(run.error) : ""}${records ? "" : UNSIGNED}`;
+  return { results, exitCode: run.status, crashed: !records || runCrashed(run, results), log: log.slice(-4000) };
 }
 
 /**
