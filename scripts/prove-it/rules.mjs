@@ -1,24 +1,14 @@
-// Rules that look only at lines a pull request adds.
+// Rules that look at lines a pull request adds. HTML sinks live in sinks.mjs.
 
-const CODE_EXT = /\.(astro|[cm]?js|jsx|tsx?|vue|svelte|html?)$/i;
 const DOC_EXT = /\.mdx?$/i;
-const COMMENT = /^\s*(\/\/|\/\*|\*|<!--|\{\s*\/\*)/;
-const SINKS = [
-  { name: "set:html", re: /set:html\s*=\s*\{(.*)\}/ },
-  { name: "innerHTML", re: /\.(?:inner|outer)HTML\s*\+?=\s*(.*)$/ },
-  { name: "insertAdjacentHTML", re: /insertAdjacentHTML\s*\((.*)\)/ },
-  { name: "document.write", re: /document\.write(?:ln)?\s*\((.*)\)/ },
-  { name: "dangerouslySetInnerHTML", re: /dangerouslySetInnerHTML\s*=\s*\{(.*)\}/ },
-  { name: "v-html", re: /v-html\s*=\s*"([^"]*)"/ },
-  { name: "@html", re: /\{@html\s+(.*)\}/ },
-];
-const LITERAL = /^\s*(["'`])(?:(?!\1|\$\{).)*\1\s*;?\s*$/;
-const INLINE_ESCAPE = /\.replace(?:All)?\(\s*\/(?:<|\[[^\]]*<[^\]]*\])\/g?/;
 
-// Same character classes as hardenUnicodeText in actions/setup/js/sanitize_content_core.cjs.
+// hardenUnicodeText (actions/setup/js/sanitize_content_core.cjs) strips U+202A-202E, U+2066-2069,
+// U+E0000-E007F, U+00AD, U+034F, U+200B-200F, U+2060-2064 and U+FEFF. The gate adds the
+// variation selectors (U+FE00-FE0E, U+E0100-E01EF) and the fillers U+115F, U+1160, U+180E,
+// U+3164 and U+FFA0, which also render as nothing. U+FE0F (emoji style) is left alone.
 const BIDI = /[\u202A-\u202E\u2066-\u2069]/u;
-const TAG = /[\u{E0000}-\u{E007F}]/u;
-const INVISIBLE = /[\u00AD\u034F\u200B-\u200F\u2060-\u2064\uFEFF]/gu;
+const TAG = /[\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u;
+const INVISIBLE = /[\u00AD\u034F\u115F\u1160\u180E\u200B-\u200F\u2060-\u2064\u3164\uFE00-\uFE0E\uFEFF\uFFA0]/gu;
 const PICTO = /\p{Extended_Pictographic}/u;
 const EMOJI_PART = /[\p{Extended_Pictographic}\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
 
@@ -26,33 +16,6 @@ const FRONTMATTER = [/<\s*\/?\s*script/i, /<\//, /\bon[a-z]+\s*=/i, /javascript\
 
 function finding(rule, severity, path, line, message) {
   return { rule, severity, path, line, message };
-}
-
-function classify(expr, sanitizers) {
-  if (LITERAL.test(expr)) return "literal";
-  if (INLINE_ESCAPE.test(expr)) return "sanitized";
-  const called = [...expr.matchAll(/([A-Za-z_$][\w$]*)\s*\(/g)].map(m => m[1]);
-  return called.some(name => sanitizers.has(name)) ? "sanitized" : "unsanitized";
-}
-
-function sinkFinding(path, { line, text }, sanitizers) {
-  for (const sink of SINKS) {
-    const match = sink.re.exec(text);
-    if (!match || classify(match[1], sanitizers) !== "unsanitized") continue;
-    const inScript = /<script\b/i.test(text);
-    const hint = inScript && sanitizers.size ? ` Existing escapers: ${[...sanitizers].sort().join(", ")}.` : "";
-    const where = inScript ? "inside a <script> element" : "in HTML";
-    return finding("sink", inScript ? "high" : "medium", path, line, `${sink.name} writes unescaped data ${where}.${hint}`);
-  }
-  return null;
-}
-
-export function scanSinks(file, sanitizers) {
-  if (!CODE_EXT.test(file.path)) return [];
-  return file.added
-    .filter(added => !COMMENT.test(added.text))
-    .map(added => sinkFinding(file.path, added, sanitizers))
-    .filter(Boolean);
 }
 
 function charBefore(text, index) {
@@ -77,7 +40,7 @@ function codepoints(chars) {
 
 function unicodeFinding(path, { line, text }) {
   const strong = [...text].filter(ch => BIDI.test(ch) || TAG.test(ch));
-  if (strong.length) return finding("unicode", "high", path, line, `bidi or tag characters ${codepoints(strong)} can hide text from reviewers.`);
+  if (strong.length) return finding("unicode", "high", path, line, `bidi, tag or variation selector characters ${codepoints(strong)} can hide text from reviewers.`);
   const weak = hiddenChars(text);
   if (weak.length) return finding("unicode", "medium", path, line, `invisible characters ${codepoints(weak)}.`);
   return null;
@@ -103,12 +66,23 @@ export function scanFrontmatter(file, content) {
     .map(added => finding("frontmatter", "medium", file.path, added.line, "frontmatter holds HTML or script text that ends up in page metadata."));
 }
 
-/** Names of exported escape*, sanitize* and serialize* functions in `git grep -n` output. */
+/** Exported escape*, sanitize* and serialize* functions in `git grep -n <rev>` output, as name -> Set of paths. */
 export function parseSanitizers(grepOutput) {
-  const names = [...grepOutput.matchAll(/export\s+(?:async\s+)?function\s+((?:escape|sanitize|serialize)\w*)/g)].map(m => m[1]);
-  return new Set(names);
+  const found = new Map();
+  for (const m of grepOutput.matchAll(/^[^:\n]*:(.+?):\d+:.*?export\s+(?:async\s+)?function\s+((?:escape|sanitize|serialize)\w*)/gm)) {
+    if (!found.has(m[2])) found.set(m[2], new Set());
+    found.get(m[2]).add(m[1]);
+  }
+  return found;
+}
+
+/** Findings for changed files that define an escaper the gate trusts. */
+export function scanSanitizerChanges(paths, sanitizers) {
+  const changed = new Set(paths);
+  return [...sanitizers]
+    .flatMap(([name, files]) => [...files].filter(file => changed.has(file)).map(file => ({ name, file })))
+    .map(({ name, file }) => finding("sanitizer", "high", file, 0, `changes ${file}, which defines ${name}. The scan trusts calls to it, so a person must review this change.`));
 }
 
 export const SANITIZER_PATTERN = "export (async )?function (escape|sanitize|serialize)[A-Za-z0-9_]*";
-export const isCodePath = path => CODE_EXT.test(path);
 export const isDocPath = path => DOC_EXT.test(path);

@@ -1,8 +1,10 @@
 name: Prove-it gate
 
-# Scans the lines a pull request adds, builds a small site with the PR's own docs Head
-# component to see whether attack strings run as script, and compares the docs node tests
-# before and after the change. Reproduce any run locally with the command in its summary.
+# Scans the lines a pull request adds, builds a small site with the PR's own Starlight component
+# overrides to see whether attack strings run as script, and compares the docs node tests before
+# and after the change. Packages come from the base lock file with install scripts off, and the
+# PR's own code (site builds, docs tests) runs in a container with no network. Reproduce any run
+# locally with the command in its summary.
 
 on:
   pull_request:
@@ -30,13 +32,18 @@ jobs:
       GATE_BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
       GATE_HEAD: ${{ github.event.pull_request.head.sha || inputs.head }}
     steps:
-      # The gate code comes from the base branch, so a pull request cannot change the rules it is judged by.
+      # The gate code and the package list come from the base branch, so a pull request cannot
+      # change the rules it is judged by or the packages that judge it.
       - name: Checkout gate code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
           path: gate
-          sparse-checkout: scripts/prove-it
+          sparse-checkout: |
+            /scripts/prove-it/
+            /docs/package.json
+            /docs/package-lock.json
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Checkout change
@@ -50,10 +57,10 @@ jobs:
       - name: Check the base has the gate
         id: present
         run: |
-          if [ -f gate/scripts/prove-it/gate.mjs ]; then
+          if [ -f gate/scripts/prove-it/gate.mjs ] && [ -f gate/docs/package-lock.json ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::The base revision has no scripts/prove-it, so there is nothing to run."
+            echo "::notice::The base revision has no scripts/prove-it or docs lock file, so there is nothing to run."
           fi
 
       - name: Setup Node.js
@@ -62,21 +69,31 @@ jobs:
         with:
           node-version: '24'
           cache: 'npm'
-          cache-dependency-path: 'repo/docs/package-lock.json'
+          cache-dependency-path: 'gate/docs/package-lock.json'
 
+      # --ignore-scripts: no package can run code during install.
       - name: Install docs dependencies
         if: steps.present.outputs.run == 'true'
-        working-directory: repo/docs
-        run: npm ci --legacy-peer-deps
+        working-directory: gate/docs
+        run: npm ci --ignore-scripts --legacy-peer-deps
 
       - name: Install Chromium
         if: steps.present.outputs.run == 'true'
-        working-directory: repo/docs
-        run: npx playwright install --with-deps chromium
+        working-directory: gate/docs
+        run: npx --no-install playwright install --with-deps chromium
+
+      - name: Pull sandbox image
+        if: steps.present.outputs.run == 'true'
+        run: |
+          image="$(node --input-type=module -e 'const { IMAGE } = await import(process.argv[1]); console.log(IMAGE)' "$GITHUB_WORKSPACE/gate/scripts/prove-it/sandbox.mjs")"
+          docker pull "$image"
 
       - name: Run gate
         if: steps.present.outputs.run == 'true'
-        run: node gate/scripts/prove-it/gate.mjs run --repo repo --base "$GATE_BASE" --head "$GATE_HEAD" --out "$RUNNER_TEMP/prove-it"
+        run: >-
+          node gate/scripts/prove-it/gate.mjs run --repo repo
+          --base "$GATE_BASE" --head "$GATE_HEAD" --out "$RUNNER_TEMP/prove-it"
+          --node-modules gate/docs/node_modules --isolate docker
 
       - name: Write summary
         if: always() && steps.present.outputs.run == 'true'

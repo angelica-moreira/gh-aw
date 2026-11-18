@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Prove-it gate CLI.
-//   node scripts/prove-it/gate.mjs run  --base <rev> --head <rev> --out <new dir> [--repo <dir>] [--node-modules <dir>]
+//   node scripts/prove-it/gate.mjs run  --base <rev> --head <rev> --out <new dir> [--repo <dir>] [--node-modules <dir>] [--isolate none|docker]
 //   node scripts/prove-it/gate.mjs scan --base <rev> --head <rev> [--repo <dir>]
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, symlinkSync, unlinkSync } from "node:fs";
@@ -10,17 +10,18 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { decide, summary } from "./decide.mjs";
 import { git, mergeBase, resolveCommit } from "./git.mjs";
-import { prove } from "./proof.mjs";
+import { newMarker, prove } from "./proof.mjs";
+import { forTree, ISOLATIONS } from "./sandbox.mjs";
 import { scan } from "./scan.mjs";
-import { compareResults, recheckFlips, runTests, testFiles } from "./tests.mjs";
+import { compareResults, recheckFlips, runTests, testFiles, useBaseTests } from "./tests.mjs";
 
 const GATE_DIR = fileURLToPath(new URL(".", import.meta.url));
 const PROOF_PATHS = /^docs\/(src\/|astro\.config\.|package(-lock)?\.json$)/;
 const TEST_PATHS = /^docs\//;
 
-function gateHash() {
+export function gateHash(dir = GATE_DIR) {
   const hash = createHash("sha256");
-  for (const name of readdirSync(GATE_DIR).filter(n => n.endsWith(".mjs")).sort()) hash.update(name).update(readFileSync(join(GATE_DIR, name)));
+  for (const name of readdirSync(dir).filter(n => n.endsWith(".mjs")).sort()) hash.update(name).update(readFileSync(join(dir, name)));
   return hash.digest("hex");
 }
 
@@ -33,10 +34,18 @@ async function assertNewDir(dir) {
   await mkdir(dir, { recursive: true });
 }
 
+// A node_modules folder inside the checkout would come from the change itself and could replace trusted packages.
+export function linkNodeModules(dir, nodeModules) {
+  if (!existsSync(join(dir, "docs"))) return;
+  for (const own of [join(dir, "node_modules"), join(dir, "docs", "node_modules")]) {
+    if (lstatSafe(own)) throw new Error(`the checkout already has ${own}; the gate only uses the trusted install`);
+  }
+  if (existsSync(nodeModules)) symlinkSync(nodeModules, join(dir, "docs", "node_modules"), process.platform === "win32" ? "junction" : "dir");
+}
+
 function addWorktree(repo, dir, sha, nodeModules) {
   git(["worktree", "add", "--detach", "--force", dir, sha], repo);
-  const link = join(dir, "docs", "node_modules");
-  if (existsSync(join(dir, "docs")) && existsSync(nodeModules) && !existsSync(link)) symlinkSync(nodeModules, link, process.platform === "win32" ? "junction" : "dir");
+  linkNodeModules(dir, nodeModules);
   return dir;
 }
 
@@ -56,25 +65,30 @@ function lstatSafe(path) {
   }
 }
 
-async function runProof(trees) {
-  const base = await prove({ docsDir: join(trees.base, "docs") });
-  const head = await prove({ docsDir: join(trees.head, "docs") });
+async function runProof(trees, ctx) {
+  const marker = newMarker();
+  const common = { marker, nodeModules: ctx.nodeModules };
+  const base = await prove({ ...common, docsDir: join(trees.base, "docs"), sandbox: forTree(ctx.sandbox, trees.base) });
+  const head = await prove({ ...common, docsDir: join(trees.head, "docs"), sandbox: forTree(ctx.sandbox, trees.head) });
   return { base, head };
 }
 
-function runTestGate(trees) {
+function runTestGate(trees, sandbox) {
   const baseDocs = join(trees.base, "docs");
   const headDocs = join(trees.head, "docs");
-  const base = runTests(baseDocs, testFiles(baseDocs));
-  const head = runTests(headDocs, testFiles(headDocs));
+  const sandboxes = { base: forTree(sandbox, trees.base), head: forTree(sandbox, trees.head) };
+  const replacedTests = useBaseTests(baseDocs, headDocs);
+  const base = runTests(baseDocs, testFiles(baseDocs), sandboxes.base);
+  const head = runTests(headDocs, testFiles(headDocs), sandboxes.head);
   const compare = compareResults(base.results, head.results);
-  const rechecks = recheckFlips(compare.flipped, baseDocs, headDocs);
+  const rechecks = recheckFlips(compare.flipped, baseDocs, headDocs, { sandboxes });
   return {
     base: Object.fromEntries(base.results),
     head: Object.fromEntries(head.results),
     crashed: { base: base.crashed, head: head.crashed },
     compare,
     rechecks,
+    replacedTests,
     logs: { base: base.log, head: head.log },
   };
 }
@@ -88,8 +102,8 @@ async function deepStages(ctx, scanResult) {
   try {
     addWorktree(ctx.repo, trees.base, ctx.base, ctx.nodeModules);
     addWorktree(ctx.repo, trees.head, ctx.head, ctx.nodeModules);
-    const proof = touchesSite ? await runProof(trees) : null;
-    const tests = touchesDocs ? runTestGate(trees) : null;
+    const proof = touchesSite ? await runProof(trees, ctx) : null;
+    const tests = touchesDocs ? runTestGate(trees, ctx.sandbox) : null;
     return { proof, tests };
   } finally {
     removeWorktree(ctx.repo, trees.base);
@@ -107,21 +121,30 @@ async function writeRun(out, run) {
   await writeFile(join(out, "summary.md"), summary(run), { flag: "wx" });
 }
 
+function sandboxFor(isolate, nodeModules) {
+  if (!ISOLATIONS.includes(isolate)) throw new Error(`--isolate must be one of: ${ISOLATIONS.join(", ")}`);
+  return { isolate, readOnly: existsSync(nodeModules) ? [nodeModules] : [] };
+}
+
 export async function runGate(options) {
   const repo = resolve(options.repo ?? ".");
   const out = resolve(options.out);
   await assertNewDir(out);
   const nodeModules = options["node-modules"] ? resolve(options["node-modules"]) : join(repo, "docs", "node_modules");
-  const run = { gate: gateHash(), tools: toolVersions(repo), startedAt: new Date().toISOString(), base: options.base, head: options.head };
+  const isolate = options.isolate ?? "none";
+  const gate = gateHash();
+  const run = { gate, isolation: isolate, tools: toolVersions(repo), startedAt: new Date().toISOString(), base: options.base, head: options.head };
   const errors = [];
   try {
+    const sandbox = sandboxFor(isolate, nodeModules);
     const head = resolveCommit(options.head, repo);
     const requested = resolveCommit(options.base, repo);
-    const ctx = { repo, out, nodeModules, cwd: repo, base: mergeBase(requested, head, repo), head };
+    const ctx = { repo, out, nodeModules, sandbox, cwd: repo, base: mergeBase(requested, head, repo), head };
     Object.assign(run, { requestedBase: requested, base: ctx.base, head }, await stages(ctx));
   } catch (error) {
     errors.push(error.message.split("\n")[0]);
   }
+  if (gateHash() !== gate) errors.push("the gate's own files changed while it ran");
   run.errors = errors;
   run.decision = decide(run);
   run.finishedAt = new Date().toISOString();
@@ -142,10 +165,10 @@ async function main(argv) {
   const { positionals, values } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { base: { type: "string" }, head: { type: "string" }, out: { type: "string" }, repo: { type: "string" }, "node-modules": { type: "string" } },
+    options: { base: { type: "string" }, head: { type: "string" }, out: { type: "string" }, repo: { type: "string" }, "node-modules": { type: "string" }, isolate: { type: "string" } },
   });
   const [command] = positionals;
-  if (!values.base || !values.head || (command === "run" && !values.out)) throw new Error("usage: gate.mjs run|scan --base <rev> --head <rev> [--out <dir>] [--repo <dir>] [--node-modules <dir>]");
+  if (!values.base || !values.head || (command === "run" && !values.out)) throw new Error("usage: gate.mjs run|scan --base <rev> --head <rev> [--out <dir>] [--repo <dir>] [--node-modules <dir>] [--isolate none|docker]");
   if (command === "scan") return scanOnly(values);
   if (command !== "run") throw new Error(`unknown command: ${command}`);
   const run = await runGate(values);
