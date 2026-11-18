@@ -69,6 +69,26 @@ function lstatSafe(path) {
 
 const sandboxesFor = (trees, sandbox) => ({ base: forTree(sandbox, trees.base), head: forTree(sandbox, trees.head) });
 
+/**
+ * Functions that each check out a new worktree of one revision for a single mutation run. Head
+ * gets the base tests, as in the test gate. Disposing removes the worktree with whatever ran in it.
+ */
+function workspacesFor(ctx, trees) {
+  let count = 0;
+  const open = rev => () => {
+    const tree = join(ctx.out, "work", `mutant-${count++}`);
+    try {
+      addWorktree(ctx.repo, tree, ctx[rev], ctx.nodeModules);
+      if (rev === "head") useBaseTests(join(trees.base, "docs"), join(tree, "docs"));
+    } catch (error) {
+      removeWorktree(ctx.repo, tree);
+      throw error;
+    }
+    return { tree, sandbox: forTree(ctx.sandbox, tree), dispose: () => removeWorktree(ctx.repo, tree) };
+  };
+  return { base: open("base"), head: open("head") };
+}
+
 async function runProof(trees, ctx) {
   const marker = newMarker();
   const sandboxes = sandboxesFor(trees, ctx.sandbox);
@@ -109,8 +129,7 @@ async function deepStages(ctx, scanResult) {
     addWorktree(ctx.repo, trees.head, ctx.head, ctx.nodeModules);
     const proof = touchesSite ? await runProof(trees, ctx) : null;
     const tests = touchesDocs ? runTestGate(trees, ctx.sandbox) : null;
-    // Runs after the test gate, so head already holds the base tests.
-    const mutations = touchesDocs ? mutationCheck(trees, scanResult.escapers, { parser: ctx.parser, sandboxes: sandboxesFor(trees, ctx.sandbox), tests }) : null;
+    const mutations = touchesDocs ? mutationCheck(scanResult.escapers, { parser: ctx.parser, workspaces: workspacesFor(ctx, trees), tests }) : null;
     return { proof, tests, mutations };
   } finally {
     removeWorktree(ctx.repo, trees.base);

@@ -40,6 +40,34 @@ jobs:
         with:
           fail-on-severity: high
 
+  # Runs the attack suite for the gate's test sandbox in the real container, so a change that
+  # weakens the sandbox (or the gate code itself) fails here. It needs no token or secret.
+  sandbox-attacks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gate code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: /scripts/prove-it/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Pull sandbox image
+        run: |
+          image="$(node --input-type=module -e 'const { IMAGE } = await import(process.argv[1]); console.log(IMAGE)' "$GITHUB_WORKSPACE/scripts/prove-it/sandbox.mjs")"
+          docker pull "$image"
+
+      - name: Run attack suite
+        env:
+          PROVE_IT_ISOLATE: docker
+        run: node --test scripts/prove-it/sandbox.test.mjs
+
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45

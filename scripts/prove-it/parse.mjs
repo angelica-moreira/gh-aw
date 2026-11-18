@@ -10,14 +10,17 @@ const SCRIPT = /\.(?:[cm]?js|jsx)$/i;
 const SKIP_KEYS = new Set(["loc", "extra", "comments", "leadingComments", "trailingComments", "innerComments", "errors", "tokens"]);
 const OPAQUE = new Set(["StringLiteral", "DirectiveLiteral", "RegExpLiteral", "TemplateLiteral", "InterpreterDirective"]);
 
-/** @babel/parser from the trusted install, or null when it is missing. */
-export function loadParser(nodeModules) {
+/** A package from the trusted install, or null when it is missing. */
+export function loadTrusted(nodeModules, name) {
   try {
-    return createRequire(resolve(nodeModules, "..", "package.json"))("@babel/parser");
+    return createRequire(resolve(nodeModules, "..", "package.json"))(name);
   } catch {
     return null;
   }
 }
+
+/** @babel/parser from the trusted install, or null when it is missing. */
+export const loadParser = nodeModules => loadTrusted(nodeModules, "@babel/parser");
 
 function pluginsFor(path) {
   if (TS.test(path)) return ["typescript"];

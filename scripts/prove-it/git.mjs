@@ -54,3 +54,9 @@ export function grepAt(rev, pattern, pathspecs, cwd) {
     throw error;
   }
 }
+
+/** The file at `rev`, or null when `rev` has no file at `path`. */
+export function optionalFileAt(rev, path, cwd) {
+  const listed = git(["ls-tree", "--name-only", rev, "--", path], cwd).trim();
+  return listed === path ? git(["show", `${rev}:${path}`], cwd) : null;
+}

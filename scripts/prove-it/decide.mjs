@@ -41,6 +41,8 @@ function unknownBaseReasons(base, head) {
   const reasons = [{ level: "warn", text: `The browser proof could not finish before this change (${base.reason}), so pages cannot be compared.` }];
   const pages = head.pages ?? [];
   if (pages.length) reasons.push({ level: "warn", text: `Attack strings ran as script after this change on ${pages.length} page(s): ${pages.join(", ")}.` });
+  const broken = (head.results ?? []).filter(p => p.ld?.broken).map(p => p.page);
+  if (broken.length) reasons.push({ level: "warn", text: `JSON-LD does not parse, or holds text that can end its script block, after this change on ${broken.length} page(s): ${broken.join(", ")}.` });
   return reasons;
 }
 
@@ -49,7 +51,28 @@ function proofReasons(proof) {
   const { base, head } = proof;
   const reasons = inconclusive(head) ? [{ level: "block", text: `The browser proof could not finish after this change: ${head.reason}.` }] : [];
   reasons.push(...(inconclusive(base) ? unknownBaseReasons(base, head) : pageReasons(base, head)));
-  return [...reasons, ...writeReasons(base, head)];
+  return [...reasons, ...writeReasons(base, head), ...policyReasons(base, head), ...jsonLdReasons(base, head)];
+}
+
+const NO_LD = { broken: 0, kept: 0 };
+const ldByPage = side => new Map((side.results ?? []).filter(p => p.ld).map(p => [p.page, p.ld]));
+
+/**
+ * The gate reads JSON-LD from the built files itself. A block that no longer parses or is unsafe,
+ * or attack strings that no longer survive as text, mean the escaping broke or dropped the content
+ * (an escaper that returns "" is not a fix). Pages are compared with base, so only change is judged.
+ */
+function jsonLdReasons(base, head) {
+  if (inconclusive(base) || inconclusive(head)) return [];
+  const before = ldByPage(base);
+  const after = ldByPage(head);
+  const pages = [...new Set([...before.keys(), ...after.keys()])].map(page => ({ page, was: before.get(page) ?? NO_LD, now: after.get(page) ?? NO_LD }));
+  const broke = pages.filter(p => p.now.broken > p.was.broken).map(p => p.page);
+  const lost = pages.filter(p => p.now.kept < p.was.kept).map(p => p.page);
+  const reasons = [];
+  if (broke.length) reasons.push({ level: "block", text: `JSON-LD no longer parses, or holds text that can end its script block, on ${broke.length} page(s): ${broke.join(", ")}.` });
+  if (lost.length) reasons.push({ level: "block", text: `JSON-LD no longer carries the page text it had before this change on ${lost.length} page(s): ${lost.join(", ")}.` });
+  return reasons;
 }
 
 // Page code can skip the recorder with its own Trusted Types policy, so writes only warn.
@@ -58,6 +81,14 @@ function writeReasons(base, head) {
   const more = (head.results ?? []).filter(p => (p.writes ?? 0) > (before.get(p.page) ?? 0)).map(p => p.page);
   if (!more.length) return [];
   return [{ level: "warn", text: `This change writes attack strings into HTML more often on ${more.length} page(s), even if they did not run: ${more.join(", ")}.` }];
+}
+
+// HTML written through a page's own policy skips the write recorder; Chromium still reports the policy's name.
+function policyReasons(base, head) {
+  const before = new Map((base.results ?? []).map(p => [p.page, new Set(p.policies ?? [])]));
+  const added = (head.results ?? []).flatMap(p => (p.policies ?? []).filter(name => !before.get(p.page)?.has(name)).map(name => `${p.page} (${name})`));
+  if (!added.length) return [];
+  return [{ level: "warn", text: `This change creates Trusted Types policies that HTML writes can pass through unrecorded, on ${added.length} page(s): ${added.join(", ")}.` }];
 }
 
 const rate = value => (value === null ? "could not rerun" : `${Math.round(value * 100)}%`);
@@ -78,14 +109,13 @@ function testReasons(tests) {
   return reasons;
 }
 
-const CAUGHT = new Set(["killed", "crashed"]);
-
 // Pass-through mutants: an escaper that hands back its input unchanged must make a test fail.
 function mutationReason({ name, file, base, head }) {
   const what = `${name} (${file})`;
-  if (head === "survived" && CAUGHT.has(base)) return [{ level: "block", text: `The docs tests caught a broken ${what} before this change, but not after it.` }];
+  if (head === "killed") return [];
+  if (head === "survived" && base === "killed") return [{ level: "block", text: `The docs tests caught a broken ${what} before this change, but not after it.` }];
   if (head === "survived") return [{ level: "warn", text: `No docs test fails when ${what} is broken${base === "survived" ? "; this was already true before this change" : ""}.` }];
-  if (head === "skipped" && CAUGHT.has(base)) return [{ level: "warn", text: `The gate could not break ${what} after this change, so it could not check that the tests catch it.` }];
+  if (base === "killed" || head === "inconclusive") return [{ level: "warn", text: `The gate could not check that the docs tests catch a broken ${what} after this change (${head}).` }];
   return [];
 }
 
@@ -131,7 +161,7 @@ function mutationLines(mutations) {
   if (!mutations) return ["Not run: the change does not touch the docs site."];
   if (!mutations.length) return ["No escaper under docs/ to break."];
   const rows = mutations.map(m => `| \`${cell(m.name)}\` | \`${cell(m.file)}\` | ${m.base} | ${m.head} |`);
-  return ["Each escaper is changed to return its input unescaped, then the docs tests run again. \"killed\" means a test that passed without the change now fails, as it should; \"no-baseline\" means the unchanged tests could not run.", "", "| Escaper | File | Before | After |", "|---|---|---|---|", ...rows];
+  return ["Each escaper is changed to return its input unescaped in a fresh checkout, then the docs tests run again. \"killed\" means a test that passed without the change now fails, as it should; \"inconclusive\" means the run broke or a test that passed did not report, so it shows nothing; \"no-baseline\" means the unchanged tests could not run.", "", "| Escaper | File | Before | After |", "|---|---|---|---|", ...rows];
 }
 
 export function summary(run) {
