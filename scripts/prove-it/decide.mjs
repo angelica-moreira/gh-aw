@@ -49,7 +49,15 @@ function proofReasons(proof) {
   const { base, head } = proof;
   const reasons = inconclusive(head) ? [{ level: "block", text: `The browser proof could not finish after this change: ${head.reason}.` }] : [];
   reasons.push(...(inconclusive(base) ? unknownBaseReasons(base, head) : pageReasons(base, head)));
-  return reasons;
+  return [...reasons, ...writeReasons(base, head)];
+}
+
+// Page code can skip the recorder with its own Trusted Types policy, so writes only warn.
+function writeReasons(base, head) {
+  const before = new Map((base.results ?? []).map(p => [p.page, p.writes ?? 0]));
+  const more = (head.results ?? []).filter(p => (p.writes ?? 0) > (before.get(p.page) ?? 0)).map(p => p.page);
+  if (!more.length) return [];
+  return [{ level: "warn", text: `This change writes attack strings into HTML more often on ${more.length} page(s), even if they did not run: ${more.join(", ")}.` }];
 }
 
 const rate = value => (value === null ? "could not rerun" : `${Math.round(value * 100)}%`);
@@ -70,12 +78,24 @@ function testReasons(tests) {
   return reasons;
 }
 
-export function decide({ errors = [], scan, proof, tests }) {
+const CAUGHT = new Set(["killed", "crashed"]);
+
+// Pass-through mutants: an escaper that hands back its input unchanged must make a test fail.
+function mutationReason({ name, file, base, head }) {
+  const what = `${name} (${file})`;
+  if (head === "survived" && CAUGHT.has(base)) return [{ level: "block", text: `The docs tests caught a broken ${what} before this change, but not after it.` }];
+  if (head === "survived") return [{ level: "warn", text: `No docs test fails when ${what} is broken${base === "survived" ? "; this was already true before this change" : ""}.` }];
+  if (head === "skipped" && CAUGHT.has(base)) return [{ level: "warn", text: `The gate could not break ${what} after this change, so it could not check that the tests catch it.` }];
+  return [];
+}
+
+export function decide({ errors = [], scan, proof, tests, mutations }) {
   const reasons = [
     ...errors.map(text => ({ level: "block", text: `The gate could not run: ${text}` })),
     ...(scan ? scanReasons(scan) : []),
     ...proofReasons(proof),
     ...testReasons(tests),
+    ...(mutations ?? []).flatMap(mutationReason),
   ];
   return { blocked: reasons.some(r => r.level === "block"), reasons };
 }
@@ -91,18 +111,27 @@ function findingsTable(findings) {
   return ["| Severity | Rule | Where | What |", "|---|---|---|---|", ...rows];
 }
 
+const details = (title, lines) => (lines.length ? ["", `<details><summary>${title}</summary>`, "", "```text", ...lines, "```", "", "</details>"] : []);
+
 function proofLines(proof) {
   if (!proof) return ["Not run: the change does not touch the docs site code."];
   const lines = [`- Before: **${proof.base.verdict}**: ${proof.base.reason}`, `- After: **${proof.head.verdict}**: ${proof.head.reason}`];
-  const hits = (proof.head.results ?? []).filter(p => p.runs > 0);
-  if (!hits.length) return lines;
-  const where = hits.flatMap(p => (p.context ?? []).map(c => plain(`${p.page}: ${c}`)));
-  return [...lines, "", "<details><summary>Where the script ran (after)</summary>", "", "```text", ...where, "```", "", "</details>"];
+  const results = proof.head.results ?? [];
+  const where = results.filter(p => p.runs > 0).flatMap(p => (p.context ?? []).map(c => plain(`${p.page}: ${c}`)));
+  const writes = results.filter(p => p.writes > 0).map(p => plain(`${p.page}: ${(p.sinks ?? []).join(", ")}`));
+  return [...lines, ...details("Where the script ran (after)", where), ...details("HTML writes that held an attack string (after)", writes)];
 }
 
 function testLines(tests) {
   if (!tests) return ["Not run: the change does not touch the docs site."];
   return [`- Before: ${Object.keys(tests.base).length} test(s); after: ${Object.keys(tests.head).length} test(s).`, `- Broke: ${tests.compare.flipped.length}; missing: ${tests.compare.missing.length}; new failures: ${tests.compare.newFailures.length}.`];
+}
+
+function mutationLines(mutations) {
+  if (!mutations) return ["Not run: the change does not touch the docs site."];
+  if (!mutations.length) return ["No escaper under docs/ to break."];
+  const rows = mutations.map(m => `| \`${cell(m.name)}\` | \`${cell(m.file)}\` | ${m.base} | ${m.head} |`);
+  return ["Each escaper is changed to return its input unescaped, then the docs tests run again. \"killed\" means a test that passed without the change now fails, as it should; \"no-baseline\" means the unchanged tests could not run.", "", "| Escaper | File | Before | After |", "|---|---|---|---|", ...rows];
 }
 
 export function summary(run) {
@@ -127,6 +156,10 @@ export function summary(run) {
     "### Docs tests",
     "",
     ...testLines(run.tests),
+    "",
+    "### Escaper mutation check",
+    "",
+    ...mutationLines(run.mutations),
     "",
     "### Reproduce",
     "",

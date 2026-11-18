@@ -5,6 +5,9 @@ name: Prove-it gate
 # and after the change. Packages come from the base lock file with install scripts off, and the
 # PR's own code (site builds, docs tests) runs in a container with no network. Reproduce any run
 # locally with the command in its summary.
+#
+# Not repeated here because other workflows or repository settings already cover them: CodeQL,
+# zizmor, poutine, actionlint, gosec, govulncheck and secret scanning.
 
 on:
   pull_request:
@@ -25,6 +28,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The gate installs packages from the base lock file only; this checks the packages a pull
+  # request adds or changes against the GitHub Advisory Database.
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+        with:
+          fail-on-severity: high
+
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -76,6 +91,12 @@ jobs:
         if: steps.present.outputs.run == 'true'
         working-directory: gate/docs
         run: npm ci --ignore-scripts --legacy-peer-deps
+
+      # Fails when an installed package's registry signature does not verify.
+      - name: Verify package signatures
+        if: steps.present.outputs.run == 'true'
+        working-directory: gate/docs
+        run: npm audit signatures
 
       - name: Install Chromium
         if: steps.present.outputs.run == 'true'

@@ -1,6 +1,7 @@
 // Finds HTML sinks in a whole file and reports those whose expression touches an added line.
 import { posix } from "node:path";
 import { blankComments, blankStrings, matchClose, scanTo, shape, splitArgs, statementEnd } from "./lex.mjs";
+import { expressionAgrees, moduleAgrees } from "./parse.mjs";
 
 const SINK_EXT = /\.(astro|[cm]?js|jsx|tsx?|vue|svelte|html?|mdx)$/i;
 const SCRIPT_EXT = /\.(?:[cm]?js|jsx|tsx?)$/i;
@@ -88,11 +89,17 @@ function resolveImport(file, spec) {
   return posix.normalize(posix.join(posix.dirname(file), spec));
 }
 
-// Imports are read only from code: the frontmatter of an .astro file, a whole script file, or the
-// import lines of other files. Comments are blanked so a commented-out import does not count.
+// The part of a file that is one JavaScript module: a whole script, or an .astro frontmatter. Null for other files.
+function moduleCode(path, content) {
+  if (SCRIPT_EXT.test(path)) return content;
+  return /\.astro$/i.test(path) ? (/^---\r?\n([\s\S]*?)\r?\n---/.exec(content)?.[1] ?? "") : null;
+}
+
+// Imports are read only from code: the module part of a file, or the import lines of other files.
+// Comments are blanked so a commented-out import does not count.
 function importCode(path, content) {
-  if (SCRIPT_EXT.test(path)) return blankComments(content) ?? "";
-  if (/\.astro$/i.test(path)) return blankComments(/^---\r?\n([\s\S]*?)\r?\n---/.exec(content)?.[1] ?? "") ?? "";
+  const code = moduleCode(path, content);
+  if (code !== null) return blankComments(code) ?? "";
   return content.split("\n").filter(line => /^import\b/.test(line)).join("\n");
 }
 
@@ -167,40 +174,53 @@ function trustedAssets(path, content, changed) {
 
 // `\u0041`-style escapes can spell a name in an identifier that no text search sees, so nothing is trusted then.
 const IDENT_ESCAPE = /\\u(?:[0-9a-fA-F]{4}|\{)/;
+const NO_TRUST = { calls: new Set(), assets: new Set() };
 
 /** Trusted escapers and raw assets for one file. sanitizers: Map name -> Set of base paths that export it. */
 export function trustFor(path, content, sanitizers, changed = new Set()) {
-  if (IDENT_ESCAPE.test(content)) return { calls: new Set(), assets: new Set() };
+  if (IDENT_ESCAPE.test(content)) return NO_TRUST;
   return { calls: trustedCalls(path, content, sanitizers), assets: trustedAssets(path, content, changed) };
 }
 
-function isUnsafe(sink, value, trusted) {
-  return sink.parts(value.expr).some(part => classify(part, trusted) === "unsanitized");
+const MISREAD = " The gate's lexer and a JavaScript parser read this code differently, so none of it is treated as escaped.";
+
+// Why a sink value is unsafe ("" when no extra detail applies), or null when it is proven safe.
+function unsafeReason(sink, value, ctx) {
+  if (value.open) return " The gate could not find where the value ends.";
+  if (!ctx.readable || !expressionAgrees(value.expr, ctx.file.path, ctx.parser)) return MISREAD;
+  return sink.parts(value.expr).some(part => classify(part, ctx.trusted) === "unsanitized") ? "" : null;
 }
 
 function sinkFindings(ctx, sink) {
-  const { file, content, trusted, added, hint } = ctx;
+  const { file, content, added, hint } = ctx;
   const out = [];
   for (const m of content.matchAll(sink.re)) {
     const value = sink.value(content, m.index + m[0].length);
     const first = lineAt(content, m.index);
     const last = lineAt(content, value.end);
     const touched = added.filter(line => line >= first && line <= last);
-    if (touched.length === 0 || !isUnsafe(sink, value, trusted)) continue;
-    const reason = value.open ? " The gate could not find where the value ends." : "";
+    const reason = touched.length ? unsafeReason(sink, value, ctx) : null;
+    if (reason === null) continue;
     out.push({ rule: "sink", severity: "high", path: file.path, line: touched[0], message: `${sink.name} writes data the gate cannot prove is escaped.${reason}${hint}` });
   }
   return out;
 }
 
-/** Sinks in the head version of a file whose value spans an added line. sanitizers: Map name -> Set of base paths. */
-export function scanSinks(file, content, sanitizers, changed = new Set()) {
+/**
+ * Sinks in the head version of a file whose value spans an added line. sanitizers: Map name -> Set
+ * of base paths; parser: @babel/parser (see parse.mjs). Without a parser nothing is proven safe.
+ */
+export function scanSinks(file, content, { sanitizers, changed = new Set(), parser = null }) {
   if (!SINK_EXT.test(file.path)) return [];
   const names = [...sanitizers.keys()].sort();
+  const code = moduleCode(file.path, content);
+  const readable = code === null || moduleAgrees(code, file.path, parser);
   const ctx = {
     file,
     content,
-    trusted: trustFor(file.path, content, sanitizers, changed),
+    parser,
+    readable,
+    trusted: readable ? trustFor(file.path, content, sanitizers, changed) : NO_TRUST,
     added: file.added.map(a => a.line).sort((a, b) => a - b),
     hint: names.length ? ` Imported escapers the gate trusts: ${names.join(", ")}.` : "",
   };

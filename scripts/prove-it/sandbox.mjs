@@ -7,6 +7,8 @@ export const IMAGE = "node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f094
 export const ISOLATIONS = ["none", "docker"];
 const KEEP_ENV = ["PATH", "Path", "PATHEXT", "SystemRoot", "SystemDrive", "ComSpec", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG"];
 const MAX_BUFFER = 64 * 1024 * 1024;
+// Caps processes and memory so a fork bomb or runaway build stops inside the container, not the runner.
+const LIMITS = ["--pids-limit", "512", "--memory", "4g", "--memory-swap", "4g"];
 
 /** Copies only the variables a build needs, so runner files and tokens are not passed on. */
 export function childEnv(source = process.env) {
@@ -15,12 +17,13 @@ export function childEnv(source = process.env) {
   return env;
 }
 
-/** Builds the `docker run` arguments; every mount keeps its host path. */
-export function dockerArgs({ cwd, writable, readOnly, timeoutMs, user }) {
+/** Builds the `docker run` arguments; every mount keeps its host path. `stdin` keeps stdin open for `input`. */
+export function dockerArgs({ cwd, writable, readOnly, timeoutMs, user, stdin = false }) {
   const mounts = [...writable.map(p => `${p}:${p}`), ...readOnly.map(p => `${p}:${p}:ro`)].flatMap(m => ["-v", m]);
   const owner = user ? ["--user", user] : [];
+  const interactive = stdin ? ["-i"] : [];
   const seconds = String(Math.ceil(timeoutMs / 1000));
-  return ["run", "--rm", "--init", "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp", ...owner, "-e", "HOME=/tmp", "-e", "CI=1", ...mounts, "-w", cwd, IMAGE, "timeout", "-k", "10", seconds, "node"];
+  return ["run", "--rm", "--init", ...interactive, "--network", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only", "--tmpfs", "/tmp", ...LIMITS, ...owner, "-e", "HOME=/tmp", "-e", "CI=1", ...mounts, "-w", cwd, IMAGE, "timeout", "-k", "10", seconds, "node"];
 }
 
 const hostUser = () => (process.getuid ? `${process.getuid()}:${process.getgid()}` : null);
@@ -32,11 +35,11 @@ export function forTree(sandbox, tree) {
 
 /**
  * Runs `node <args>` in `cwd`. `sandbox` is { isolate, writable, readOnly } from the gate.
- * Returns the spawnSync result.
+ * `input` is written to the child's stdin. Returns the spawnSync result.
  */
-export function runNode(args, { cwd, sandbox, timeoutMs }) {
-  const options = { encoding: "utf8", maxBuffer: MAX_BUFFER };
+export function runNode(args, { cwd, sandbox, timeoutMs, input }) {
+  const options = { encoding: "utf8", maxBuffer: MAX_BUFFER, input };
   if (sandbox?.isolate !== "docker") return spawnSync(process.execPath, args, { ...options, cwd, env: childEnv(), timeout: timeoutMs });
-  const docker = dockerArgs({ cwd, writable: sandbox.writable, readOnly: sandbox.readOnly, timeoutMs, user: hostUser() });
+  const docker = dockerArgs({ cwd, writable: sandbox.writable, readOnly: sandbox.readOnly, timeoutMs, user: hostUser(), stdin: input !== undefined });
   return spawnSync("docker", [...docker, ...args], { ...options, env: childEnv(), timeout: timeoutMs + 60_000 });
 }

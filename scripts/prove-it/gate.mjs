@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Prove-it gate CLI.
 //   node scripts/prove-it/gate.mjs run  --base <rev> --head <rev> --out <new dir> [--repo <dir>] [--node-modules <dir>] [--isolate none|docker]
-//   node scripts/prove-it/gate.mjs scan --base <rev> --head <rev> [--repo <dir>]
+//   node scripts/prove-it/gate.mjs scan --base <rev> --head <rev> [--repo <dir>] [--node-modules <dir>]
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, symlinkSync, unlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -10,6 +10,8 @@ import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { decide, summary } from "./decide.mjs";
 import { git, mergeBase, resolveCommit } from "./git.mjs";
+import { mutationCheck } from "./mutate.mjs";
+import { loadParser } from "./parse.mjs";
 import { newMarker, prove } from "./proof.mjs";
 import { forTree, ISOLATIONS } from "./sandbox.mjs";
 import { scan } from "./scan.mjs";
@@ -65,18 +67,21 @@ function lstatSafe(path) {
   }
 }
 
+const sandboxesFor = (trees, sandbox) => ({ base: forTree(sandbox, trees.base), head: forTree(sandbox, trees.head) });
+
 async function runProof(trees, ctx) {
   const marker = newMarker();
-  const common = { marker, nodeModules: ctx.nodeModules };
-  const base = await prove({ ...common, docsDir: join(trees.base, "docs"), sandbox: forTree(ctx.sandbox, trees.base) });
-  const head = await prove({ ...common, docsDir: join(trees.head, "docs"), sandbox: forTree(ctx.sandbox, trees.head) });
+  const sandboxes = sandboxesFor(trees, ctx.sandbox);
+  const common = { marker, nodeModules: ctx.nodeModules, parser: ctx.parser };
+  const base = await prove({ ...common, docsDir: join(trees.base, "docs"), sandbox: sandboxes.base });
+  const head = await prove({ ...common, docsDir: join(trees.head, "docs"), sandbox: sandboxes.head });
   return { base, head };
 }
 
 function runTestGate(trees, sandbox) {
   const baseDocs = join(trees.base, "docs");
   const headDocs = join(trees.head, "docs");
-  const sandboxes = { base: forTree(sandbox, trees.base), head: forTree(sandbox, trees.head) };
+  const sandboxes = sandboxesFor(trees, sandbox);
   const replacedTests = useBaseTests(baseDocs, headDocs);
   const base = runTests(baseDocs, testFiles(baseDocs), sandboxes.base);
   const head = runTests(headDocs, testFiles(headDocs), sandboxes.head);
@@ -104,7 +109,9 @@ async function deepStages(ctx, scanResult) {
     addWorktree(ctx.repo, trees.head, ctx.head, ctx.nodeModules);
     const proof = touchesSite ? await runProof(trees, ctx) : null;
     const tests = touchesDocs ? runTestGate(trees, ctx.sandbox) : null;
-    return { proof, tests };
+    // Runs after the test gate, so head already holds the base tests.
+    const mutations = touchesDocs ? mutationCheck(trees, scanResult.escapers, { parser: ctx.parser, sandboxes: sandboxesFor(trees, ctx.sandbox), tests }) : null;
+    return { proof, tests, mutations };
   } finally {
     removeWorktree(ctx.repo, trees.base);
     removeWorktree(ctx.repo, trees.head);
@@ -126,20 +133,29 @@ function sandboxFor(isolate, nodeModules) {
   return { isolate, readOnly: existsSync(nodeModules) ? [nodeModules] : [] };
 }
 
+const nodeModulesFor = (options, repo) => (options["node-modules"] ? resolve(options["node-modules"]) : join(repo, "docs", "node_modules"));
+
+function parserFrom(nodeModules) {
+  const parser = loadParser(nodeModules);
+  if (!parser) throw new Error(`no @babel/parser under ${nodeModules}; the scan needs it to check its own reading of the code`);
+  return parser;
+}
+
 export async function runGate(options) {
   const repo = resolve(options.repo ?? ".");
   const out = resolve(options.out);
   await assertNewDir(out);
-  const nodeModules = options["node-modules"] ? resolve(options["node-modules"]) : join(repo, "docs", "node_modules");
+  const nodeModules = nodeModulesFor(options, repo);
   const isolate = options.isolate ?? "none";
   const gate = gateHash();
   const run = { gate, isolation: isolate, tools: toolVersions(repo), startedAt: new Date().toISOString(), base: options.base, head: options.head };
   const errors = [];
   try {
     const sandbox = sandboxFor(isolate, nodeModules);
+    const parser = parserFrom(nodeModules);
     const head = resolveCommit(options.head, repo);
     const requested = resolveCommit(options.base, repo);
-    const ctx = { repo, out, nodeModules, sandbox, cwd: repo, base: mergeBase(requested, head, repo), head };
+    const ctx = { repo, out, nodeModules, sandbox, parser, cwd: repo, base: mergeBase(requested, head, repo), head };
     Object.assign(run, { requestedBase: requested, base: ctx.base, head }, await stages(ctx));
   } catch (error) {
     errors.push(error.message.split("\n")[0]);
@@ -156,7 +172,7 @@ function scanOnly(options) {
   const repo = resolve(options.repo ?? ".");
   const head = resolveCommit(options.head, repo);
   const base = mergeBase(resolveCommit(options.base, repo), head, repo);
-  const result = scan({ base, head, cwd: repo });
+  const result = scan({ base, head, cwd: repo, parser: parserFrom(nodeModulesFor(options, repo)) });
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   return result.findings.some(f => f.severity === "high") ? 1 : 0;
 }
