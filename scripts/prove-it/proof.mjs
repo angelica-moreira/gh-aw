@@ -3,9 +3,10 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { serve, withBrowser } from "./browser.mjs";
+import { MODES, serve, withBrowser } from "./browser.mjs";
+import { checkJsonLd } from "./jsonld.mjs";
 import { blankComments, blankStrings, matchClose } from "./lex.mjs";
-import { moduleAgrees } from "./parse.mjs";
+import { loadTrusted, moduleAgrees } from "./parse.mjs";
 import { runNode } from "./sandbox.mjs";
 
 // Page fields that get an attack string, and how each is written in frontmatter.
@@ -155,41 +156,54 @@ export function snippetAt(site, html) {
   return line.slice(Math.max(0, col - 160), col + 40);
 }
 
-async function pageResult(visit, url, dist, file) {
+async function pageResult(visit, base, dist, file, { marker, html5 }) {
   const page = relative(dist, file).replaceAll("\\", "/");
-  const result = await visit(`${url}${page}`);
-  if (result.runs === 0) return { page, ...result };
   const html = await readFile(file, "utf8");
-  return { page, ...result, context: [...new Set(result.where.map(site => snippetAt(site, html)))] };
+  const result = { page, ...(await visit(`${base}${page}`)), ld: checkJsonLd(html, payloads(marker), html5) };
+  return result.runs === 0 ? result : { ...result, context: [...new Set(result.where.map(site => snippetAt(site, html)))] };
 }
 
-function verdictOf(pages, controlOk, hits) {
+/** The HTML file each probe page builds to, as `checkSite` names pages. */
+export const expectedPages = marker => probePages(marker).map(({ file }) => (file === "index.md" ? "index.html" : `${file.slice(0, -3)}/index.html`));
+
+/** Why the checked pages do not cover the probe, or null when they do. */
+export function coverageGap(pages, marker) {
+  const built = new Set(pages.map(p => p.page));
+  const missing = expectedPages(marker).filter(page => !built.has(page));
+  if (missing.length) return `${missing.length} probe page(s) were not built where expected, e.g. ${missing[0]}`;
+  const silent = pages.filter(p => !p.started).map(p => p.page);
+  return silent.length ? `the recorder did not start on ${silent.length} page(s), e.g. ${silent[0]}` : null;
+}
+
+function verdictOf(pages, controlOk, hits, marker) {
   const control = pages.find(p => p.page === "index.html");
-  if (!controlOk) return { verdict: "inconclusive", reason: "the known-bad control page was not seen running its script by both the recorder and the browser's CSP reports, so the browser check is not working" };
+  if (!controlOk) return { verdict: "inconclusive", reason: "the known-bad control page was not seen running its script by both the recorder and the browser's CSP reports in every browser mode, so the browser check is not working" };
   if (!control || control.runs > 0 || control.ldJsonBroken > 0) return { verdict: "inconclusive", reason: "the harmless control page did not render cleanly" };
+  const gap = coverageGap(pages, marker);
+  if (gap) return { verdict: "inconclusive", reason: gap };
   if (hits.length) return { verdict: "proven", reason: `attack strings ran as script on ${hits.length} page(s)` };
   return { verdict: "not-proven", reason: "no attack string ran as script on any probe page" };
 }
 
 // Pages that ran script are kept even when the verdict is inconclusive, so nothing recorded is lost.
-function verdict(pages, controlOk) {
+function verdict(pages, controlOk, marker) {
   const hits = pages.filter(p => p.runs > 0).map(p => p.page);
-  return { ...verdictOf(pages, controlOk, hits), pages: hits };
+  return { ...verdictOf(pages, controlOk, hits, marker), pages: hits };
 }
 
-async function checkSite(root, { base, marker, nodeModules }) {
+async function checkSite(root, { base, marker, nodeModules, html5 }) {
   const dist = join(root, "dist");
-  const server = await serve(dist, base, { [CONTROL_PATH]: controlHtml(marker) });
+  const sites = await Promise.all(MODES.map(mode => serve(dist, base, { [CONTROL_PATH]: controlHtml(marker) }, mode)));
   try {
-    return await withBrowser({ nodeModules, origin: server.origin, marker, reports: server.reports }, async visit => {
-      const control = await visit(`${server.origin}${CONTROL_PATH}`);
+    return await withBrowser({ nodeModules, marker, sites }, async visit => {
+      const control = await visit(CONTROL_PATH);
       const controlOk = control.recorded > 0 && control.reported > 0;
       const pages = [];
-      for (const file of await htmlFiles(dist)) pages.push(await pageResult(visit, `${server.origin}${base}`, dist, file));
-      return { ...verdict(pages, controlOk), checked: pages.length, results: pages };
+      for (const file of await htmlFiles(dist)) pages.push(await pageResult(visit, base, dist, file, { marker, html5 }));
+      return { ...verdict(pages, controlOk, marker), checked: pages.length, results: pages };
     });
   } finally {
-    await server.close();
+    await Promise.all(sites.map(site => site.close()));
   }
 }
 
@@ -202,6 +216,8 @@ function absoluteComponents(docsDir, components) {
  * names (which contain it) line up. Playwright is loaded from the trusted `nodeModules`.
  */
 export async function prove({ docsDir, marker, nodeModules, sandbox, parser }) {
+  const html5 = loadTrusted(nodeModules, "parse5");
+  if (!html5) return { verdict: "inconclusive", reason: `no parse5 under ${nodeModules}; the JSON-LD check needs it to read the built pages` };
   const rawConfig = await readFile(join(docsDir, "astro.config.mjs"), "utf8");
   if (!moduleAgrees(rawConfig, "astro.config.mjs", parser)) return { verdict: "inconclusive", reason: "the gate's lexer and a JavaScript parser read docs/astro.config.mjs differently" };
   const configText = blankComments(rawConfig);
@@ -209,7 +225,7 @@ export async function prove({ docsDir, marker, nodeModules, sandbox, parser }) {
   const components = findComponents(configText);
   if (!components) return { verdict: "inconclusive", reason: "docs/astro.config.mjs must name `components` once, as an object of plain `Name: \"path\"` entries" };
   if (!Object.keys(components).length) return { verdict: "inconclusive", reason: "no component overrides found in docs/astro.config.mjs" };
-  const setup = { ...findSite(configText), components: absoluteComponents(docsDir, components), marker, nodeModules };
+  const setup = { ...findSite(configText), components: absoluteComponents(docsDir, components), marker, nodeModules, html5 };
   await mkdir(join(docsDir, ".astro"), { recursive: true });
   const root = await mkdtemp(join(docsDir, ".astro", "prove-it-"));
   try {

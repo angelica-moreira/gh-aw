@@ -1,20 +1,23 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import { after, describe, test } from "node:test";
 import vm from "node:vm";
-import { filePathFor, RECORDER, serve, takeReports, WRITE_RECORDER } from "./browser.mjs";
+import { filePathFor, joinModes, MODES, RECORDER, serve, takeReports, withBrowser, WRITE_RECORDER } from "./browser.mjs";
 import { decide, summary } from "./decide.mjs";
 import { parseDiff, unquotePath } from "./diff.mjs";
 import { mergeBase, neutralEnv, resolveCommit } from "./git.mjs";
+import { APPROVALS_PATH, applyHiddenPolicy, lineHash, parseApprovals } from "./hidden.mjs";
+import { checkJsonLd, jsonLdBlocks } from "./jsonld.mjs";
 import { blankComments, blankStrings, matchClose, shape, splitArgs } from "./lex.mjs";
-import { mutant, mutationCheck, tryMutant } from "./mutate.mjs";
-import { expressionAgrees, loadParser, moduleAgrees } from "./parse.mjs";
-import { findComponents, findSite, newMarker, payloads, probePages, snippetAt } from "./proof.mjs";
-import { commentLines, frontmatterEnd, parseSanitizers, scanFrontmatter, scanHiddenComments, scanSanitizerChanges, scanUnicode } from "./rules.mjs";
+import { mutant, mutationCheck, outcome, tryMutant } from "./mutate.mjs";
+import { expressionAgrees, loadParser, loadTrusted, moduleAgrees } from "./parse.mjs";
+import { coverageGap, expectedPages, findComponents, findSite, newMarker, payloads, probePages, snippetAt } from "./proof.mjs";
+import { commentLines, excerpt, frontmatterEnd, parseSanitizers, scanFrontmatter, scanHiddenComments, scanSanitizerChanges, scanUnicode } from "./rules.mjs";
 import { childEnv, dockerArgs, forTree } from "./sandbox.mjs";
 import { scan } from "./scan.mjs";
 import { scanSinks } from "./sinks.mjs";
@@ -32,6 +35,7 @@ const FRONT = ["---", IMPORT, "---"];
 const TRUSTED = new Map([["escapeJsonLd", new Set(["docs/src/lib/json-ld.js"])]]);
 const repoRoot = join(import.meta.dirname, "..", "..");
 const PARSER = loadParser(join(repoRoot, "docs", "node_modules"));
+const HTML5 = loadTrusted(join(repoRoot, "docs", "node_modules"), "parse5");
 const scanCtx = changed => ({ sanitizers: TRUSTED, changed, parser: PARSER });
 const sinksIn = (path, content, changed) => scanSinks(added(path, ...content.split("\n")), content, scanCtx(changed));
 const sinks = (...lines) => sinksIn("docs/src/components/A.astro", [...FRONT, ...lines].join("\n"));
@@ -475,63 +479,202 @@ describe("escaper mutation check", () => {
     }
     assert.equal(mutant(ESCAPER, "a.js", "escapeX", null), null);
   });
-  test("a tested escaper is killed, an untested one survives, and both files come back unchanged", () => {
+  // A workspace factory like the gate's: every run gets a fresh copy of `src`, removed after.
+  const copies = src => {
+    const opened = [];
+    const open = () => {
+      const tree = mkdtempSync(join(tmpdir(), "prove-it-ws-"));
+      cpSync(src, tree, { recursive: true });
+      opened.push(tree);
+      return { tree, sandbox: undefined, dispose: () => rmSync(tree, { recursive: true, force: true }) };
+    };
+    return Object.assign(open, { opened });
+  };
+  test("outcome counts a kill only when a test that passed now fails", () => {
+    const baseline = { a: "pass", b: "fail", c: "skip" };
+    assert.equal(outcome(new Map([["a", "fail"]]), false, baseline), "killed");
+    assert.equal(outcome(new Map([["a", "pass"], ["b", "fail"], ["c", "fail"]]), false, baseline), "survived");
+    assert.equal(outcome(new Map([["a", "skip"]]), false, baseline), "inconclusive");
+    assert.equal(outcome(new Map(), false, baseline), "inconclusive");
+    assert.equal(outcome(new Map([["a", "fail"]]), true, baseline), "inconclusive");
+  });
+  test("a tested escaper is killed, an untested one survives, each in a fresh copy that is thrown away", () => {
     const root = mkdtempSync(join(tmpdir(), "prove-it-mutate-"));
     try {
       const docs = join(root, "base", "docs");
       mkdirSync(join(docs, "src"), { recursive: true });
       mkdirSync(join(docs, "tests"));
       writeFileSync(join(docs, "src", "x.js"), ESCAPER);
-      const untested = "export function escapeY(s) {\n  return s.replaceAll('<', '');\n}\n";
-      writeFileSync(join(docs, "src", "y.js"), untested);
+      writeFileSync(join(docs, "src", "y.js"), "export function escapeY(s) {\n  return s.replaceAll('<', '');\n}\n");
       writeFileSync(join(docs, "tests", "x.test.mjs"), 'import assert from "node:assert"; import { test } from "node:test"; import { render } from "../src/x.js";\ntest("x", () => assert.equal(render("<"), "\\\\u003c"));\n');
       writeFileSync(join(docs, "tests", "old.test.mjs"), 'import { test } from "node:test";\ntest("old", () => { throw new Error("already broken"); });\n');
       const escapers = [{ name: "escapeX", file: "docs/src/x.js" }, { name: "escapeY", file: "docs/src/y.js" }, { name: "escapeZ", file: "pkg/z.js" }];
-      const trees = { base: join(root, "base"), head: join(root, "missing") };
-      const tests = { base: { "tests/old.test.mjs > old": "fail" }, head: {}, crashed: { base: false, head: false } };
-      const result = mutationCheck(trees, escapers, { parser: PARSER, sandboxes: {}, tests });
+      const workspaces = { base: copies(join(root, "base")), head: copies(join(root, "empty")) };
+      mkdirSync(join(root, "empty"));
+      const tests = { base: { "tests/x.test.mjs > x": "pass", "tests/old.test.mjs > old": "fail" }, head: {}, crashed: { base: false, head: false } };
+      const result = mutationCheck(escapers, { parser: PARSER, workspaces, tests });
       assert.deepEqual(result.map(r => [r.name, r.base, r.head]), [["escapeX", "killed", "skipped"], ["escapeY", "survived", "skipped"]]);
       assert.equal(readFileSync(join(docs, "src", "x.js"), "utf8"), ESCAPER);
-      assert.equal(readFileSync(join(docs, "src", "y.js"), "utf8"), untested);
-      const crashed = mutationCheck(trees, escapers, { parser: PARSER, sandboxes: {}, tests: { ...tests, crashed: { base: true, head: false } } });
+      assert.equal(workspaces.base.opened.length, 2);
+      assert.ok(workspaces.base.opened.every(tree => !existsSync(tree)));
+      const crashed = mutationCheck(escapers, { parser: PARSER, workspaces, tests: { ...tests, crashed: { base: true, head: false } } });
       assert.deepEqual(crashed.map(r => r.base), ["no-baseline", "no-baseline"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
-  test("never writes through a folder that a link replaced, before or after the tests run", () => {
+  test("never writes through a committed link, and still throws the workspace away", () => {
     const root = mkdtempSync(join(tmpdir(), "prove-it-mutate-link-"));
     try {
       const outside = join(root, "outside");
       mkdirSync(outside);
-      writeFileSync(join(outside, "x.js"), "keep");
+      writeFileSync(join(outside, "x.js"), ESCAPER);
       const tree = join(root, "tree");
-      mkdirSync(join(tree, "docs", "tests"), { recursive: true });
+      mkdirSync(join(tree, "docs"), { recursive: true });
       symlinkSync(outside, join(tree, "docs", "src"), "junction");
-      const escaper = { name: "escapeX", file: "docs/src/x.js" };
-      const opts = { parser: PARSER, baseline: { results: {}, crashed: false } };
-      assert.equal(tryMutant(tree, escaper, opts), "skipped");
-      rmSync(join(tree, "docs", "src"));
-      mkdirSync(join(tree, "docs", "src"));
-      writeFileSync(join(tree, "docs", "src", "x.js"), ESCAPER);
-      const swap = `import { renameSync, symlinkSync } from "node:fs"; import { test } from "node:test";\ntest("swap", () => { renameSync(${JSON.stringify(join(tree, "docs", "src"))}, ${JSON.stringify(join(tree, "moved"))}); symlinkSync(${JSON.stringify(outside)}, ${JSON.stringify(join(tree, "docs", "src"))}, "junction"); });\n`;
-      writeFileSync(join(tree, "docs", "tests", "swap.test.mjs"), swap);
-      assert.throws(() => tryMutant(tree, escaper, opts), /replaced by a link/);
-      assert.equal(readFileSync(join(outside, "x.js"), "utf8"), "keep");
+      let disposed = 0;
+      const open = () => ({ tree, sandbox: undefined, dispose: () => disposed++ });
+      assert.equal(tryMutant(open, { name: "escapeX", file: "docs/src/x.js" }, { parser: PARSER, baseline: { results: {}, crashed: false } }), "skipped");
+      assert.equal(readFileSync(join(outside, "x.js"), "utf8"), ESCAPER);
+      assert.equal(disposed, 1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
-  test("decide blocks when the tests stop catching a broken escaper and warns when they never did", () => {
+  test("decide blocks when the tests stop catching a broken escaper and warns when it cannot tell", () => {
     const of = (base, head) => decide({ mutations: [{ name: "escapeX", file: "docs/x.js", base, head }] }).reasons.map(r => r.level);
     assert.deepEqual(of("killed", "survived"), ["block"]);
-    assert.deepEqual(of("crashed", "survived"), ["block"]);
+    assert.deepEqual(of("inconclusive", "survived"), ["warn"]);
     assert.deepEqual(of("no-baseline", "survived"), ["warn"]);
-    assert.deepEqual(of("killed", "no-baseline"), []);
     assert.deepEqual(of("survived", "survived"), ["warn"]);
     assert.deepEqual(of("skipped", "survived"), ["warn"]);
     assert.deepEqual(of("killed", "skipped"), ["warn"]);
+    assert.deepEqual(of("killed", "inconclusive"), ["warn"]);
+    assert.deepEqual(of("killed", "no-baseline"), ["warn"]);
+    assert.deepEqual(of("survived", "inconclusive"), ["warn"]);
+    assert.deepEqual(of("skipped", "skipped"), []);
     assert.deepEqual(of("killed", "killed"), []);
+  });
+});
+
+describe("JSON-LD check", () => {
+  const ld = text => `<script type="application/ld+json">${text}</script>`;
+  const BAD = "</ScRiPt><script>x=1</script><!--";
+  const safe = JSON.stringify({ name: BAD }).replaceAll("<", "\\u003c");
+  const blocksOf = html => jsonLdBlocks(html, HTML5);
+  const check = (html, texts) => checkJsonLd(html, texts, HTML5);
+  test("docs/node_modules has parse5", () => assert.ok(HTML5?.parse, "docs/node_modules must have parse5"));
+  test("jsonLdBlocks reads each block up to the browser's end tag and skips other scripts", () => {
+    const html = `<script>a</script>${ld('{"a":1}')}<SCRIPT TYPE=' Application/LD+JSON ' id=x>[2]</script >${ld("{")}`;
+    assert.deepEqual(blocksOf(html), ['{"a":1}', "[2]", "{"]);
+    assert.deepEqual(blocksOf(`${ld("1")}<script type="application/ld&#43;json">2</script>`), ["1", "2"]);
+    assert.deepEqual(blocksOf(`${ld("1")}<script type="application/ld+json">{"never":"closed"`), ["1", '{"never":"closed"']);
+  });
+  test("decoys the browser never treats as JSON-LD are not counted", () => {
+    const decoys = [
+      `<!-- ${ld(safe)} -->`,
+      `<script data-type="application/ld+json">${safe}</script>`,
+      `<svg><script type="application/ld+json">${safe}</script></svg>`,
+      `<template>${ld(safe)}</template>`,
+      `<noscript>${ld(safe)}</noscript>`,
+      `<textarea>${ld(safe)}</textarea>`,
+    ];
+    for (const html of decoys) assert.deepEqual(check(html, [BAD]), { blocks: 0, broken: 0, kept: 0 }, html);
+  });
+  test("a safe block keeps the attack string as text", () => assert.deepEqual(check(ld(safe), [BAD, "absent"]), { blocks: 1, broken: 0, kept: 1 }));
+  test("an unescaped, emptied, unsafe or unclosed block is broken and keeps nothing", () => {
+    assert.deepEqual(check(ld(JSON.stringify({ name: BAD })), [BAD]), { blocks: 1, broken: 1, kept: 0 });
+    assert.deepEqual(check(ld(""), [BAD]), { blocks: 1, broken: 1, kept: 0 });
+    assert.deepEqual(check(ld('{"a":"<!--"}'), [BAD]), { blocks: 1, broken: 1, kept: 0 });
+    assert.deepEqual(check(`<script type="application/ld+json">${safe}`, [BAD]), { blocks: 1, broken: 0, kept: 1 });
+    assert.deepEqual(check(`<script type="application/ld+json">${safe.slice(0, -1)}`, [BAD]), { blocks: 1, broken: 1, kept: 0 });
+    assert.deepEqual(check(ld("{}"), [BAD]), { blocks: 1, broken: 0, kept: 0 });
+  });
+  test("deeply nested JSON does not overflow the walk", () => {
+    const deep = `${"[".repeat(5000)}${JSON.stringify(BAD).replaceAll("<", "\\u003c")}${"]".repeat(5000)}`;
+    assert.equal(check(ld(deep), [BAD]).kept, 1);
+  });
+  test("decide blocks broken or emptied JSON-LD, including on new pages, and ignores unchanged pages", () => {
+    const side = pages => ({ verdict: "not-proven", reason: "r", pages: [], results: pages.map(([page, broken, kept]) => ({ page, runs: 0, ld: { blocks: 1, broken, kept } })) });
+    const of = (base, head) => decide({ proof: { base: side(base), head: side(head) } }).reasons.map(r => r.level);
+    assert.deepEqual(of([["a", 0, 1]], [["a", 0, 1]]), []);
+    assert.deepEqual(of([["a", 0, 1]], [["a", 1, 0]]), ["block", "block"]);
+    assert.deepEqual(of([["a", 0, 1]], [["a", 0, 0]]), ["block"]);
+    assert.deepEqual(of([["a", 0, 1]], []), ["block"]);
+    assert.deepEqual(of([], [["new", 1, 0]]), ["block"]);
+    assert.deepEqual(of([["a", 1, 0]], [["a", 1, 0]]), []);
+  });
+});
+
+describe("browser modes", () => {
+  const M = "__pitest";
+  const run = `<img src=missing onerror=${M}=1>`;
+  const side = pages => ({ verdict: "not-proven", reason: "r", pages: [], results: pages.map(([page, policies]) => ({ page, runs: 0, policies })) });
+  test("joinModes keeps the larger run count and the policy-mode writes", () => {
+    const behavior = { runs: 1, recorded: 1, reported: 1, started: 1, where: ["b"], writes: 0, sinks: [], policies: [], ldJson: 1 };
+    const policy = { runs: 0, recorded: 0, reported: 0, started: 2, where: [], writes: 3, sinks: ["s"], policies: ["mine"], ldJson: 1 };
+    assert.deepEqual(joinModes(behavior, policy), { ...behavior, recorded: 0, reported: 0, started: 1, writes: 3, sinks: ["s"], policies: ["mine"] });
+    assert.equal(joinModes(policy, behavior).runs, 1);
+  });
+  test("the report endpoint keeps policy-creation reports, flagged, and takeReports ignores them", async () => {
+    const server = await serve(tmpdir(), "/", {}, "behavior");
+    try {
+      await fetch(server.origin + "/__prove-it/csp-report", { method: "POST", body: JSON.stringify({ "csp-report": { "document-uri": "http://h/a/", "effective-directive": "trusted-types", "script-sample": `${M}x` } }) });
+      assert.deepEqual(server.reports, [{ "document-uri": "http://h/a/", "script-sample": `${M}x`, "line-number": undefined, "column-number": undefined, policy: true }]);
+      assert.deepEqual(takeReports(server.reports, "http://h/a/", M), []);
+    } finally {
+      await server.close();
+    }
+  });
+  test("coverageGap names unbuilt probe pages and pages the recorder never started on", () => {
+    const all = expectedPages("__pi0123456789ab").map(page => ({ page, started: 1 }));
+    assert.ok(all.some(p => p.page === "index.html") && all.some(p => /^blog\/.+\/index\.html$/.test(p.page)));
+    assert.equal(coverageGap(all, "__pi0123456789ab"), null);
+    assert.match(coverageGap(all.slice(1), "__pi0123456789ab"), /1 probe page\(s\) were not built where expected, e\.g\. index\.html/);
+    assert.match(coverageGap([{ ...all[0], started: 0 }, ...all.slice(1)], "__pi0123456789ab"), /recorder did not start on 1 page/);
+  });
+  test("decide warns only about policies a page did not create before", () => {
+    const of = (base, head) => decide({ proof: { base: side(base), head: side(head) } }).reasons;
+    assert.deepEqual(of([["a", ["x"]]], [["a", ["x"]]]), []);
+    assert.deepEqual(of([["a", ["x"]]], [["a", ["x", "y"]], ["b", ["default"]]]).map(r => [r.level, r.text.endsWith("a (y), b (default).")]), [["warn", true]]);
+  });
+  const fixtures = {
+    "legit.html": `<p id=p></p><script>document.getElementById("p").textContent = "ok";</script>`,
+    "named.html": `<script>const p = trustedTypes.createPolicy("mine", { createHTML: s => s }); document.body.innerHTML = p.createHTML("${run}");</script>`,
+    "own-default.html": `<script>try { trustedTypes.createPolicy("default", { createHTML: s => s }); document.body.innerHTML = "${run}"; } catch {}</script>`,
+    "frame.html": `<iframe src="child.html"></iframe>`,
+    "child.html": `<script>document.body.innerHTML = "${run}";</script>`,
+    "delayed.html": `<script>setTimeout(() => { document.body.innerHTML = "${run}"; }, 5000);</script>`,
+  };
+  const nodeModules = join(repoRoot, "docs", "node_modules");
+  const browserReady = () => {
+    try {
+      return existsSync(createRequire(join(nodeModules, "..", "package.json"))("playwright").chromium.executablePath());
+    } catch {
+      return false;
+    }
+  };
+  test("both modes find runs in frames, after timers and behind page policies, and stay quiet on plain pages", { skip: !browserReady() && "Chromium for Playwright is not installed" }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-modes-"));
+    for (const [name, html] of Object.entries(fixtures)) writeFileSync(join(dir, name), `<!doctype html><html><body>${html}</body></html>`);
+    const sites = await Promise.all(MODES.map(mode => serve(dir, "/", {}, mode)));
+    try {
+      const seen = await withBrowser({ nodeModules, marker: M, sites }, async visit => {
+        const out = {};
+        for (const name of ["legit.html", "named.html", "own-default.html", "frame.html", "delayed.html"]) out[name] = await visit(`/${name}`);
+        return out;
+      });
+      const pick = ({ runs, started, policies }) => ({ ran: runs > 0, started: started > 0, policies });
+      assert.deepEqual(pick(seen["legit.html"]), { ran: false, started: true, policies: [] });
+      assert.deepEqual(pick(seen["named.html"]), { ran: true, started: true, policies: ["mine"] });
+      assert.deepEqual(pick(seen["own-default.html"]), { ran: true, started: true, policies: ["default"] });
+      assert.deepEqual(pick(seen["frame.html"]), { ran: true, started: true, policies: [] });
+      assert.deepEqual(pick(seen["delayed.html"]), { ran: true, started: true, policies: [] });
+      assert.ok(seen["delayed.html"].writes > 0, "policy mode records the delayed HTML write");
+    } finally {
+      await Promise.all(sites.map(site => site.close()));
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -703,5 +846,62 @@ describe("git helpers on a throwaway repo", () => {
     } finally {
       delete process.env.GIT_DIR;
     }
+  });
+
+  test("hidden text in an agent file blocks unless the base branch approved that exact line", () => {
+    const line = "Be helpful.\u200B";
+    const approvals = JSON.stringify({ approvals: [{ path: "AGENTS.md", sha256: lineHash(line), reviewer: "mona", reason: "zero-width joiner kept on purpose", expires: "2026-06-30" }] });
+    const commit = (files, branch, from) => {
+      if (branch) run("checkout", "-q", "-b", branch, from);
+      for (const [path, text] of Object.entries(files)) write(path, text);
+      run("add", "-A");
+      run("commit", "-qm", "c");
+      return run("rev-parse", "HEAD");
+    };
+    const levels = (b, h, now) => scan({ base: b, head: h, cwd: repo, parser: PARSER, now }).findings.map(f => `${f.path}:${f.rule}:${f.severity}`);
+    try {
+      const selfApproved = commit({ "AGENTS.md": `${line}\n`, [APPROVALS_PATH]: approvals }, "self-approve", base);
+      assert.deepEqual(levels(base, selfApproved, Date.parse("2026-01-01")), ["AGENTS.md:unicode:high"]);
+      const approvedBase = commit({ [APPROVALS_PATH]: approvals }, "approved", base);
+      const approvedHead = commit({ "AGENTS.md": `${line}\n` });
+      const found = scan({ base: approvedBase, head: approvedHead, cwd: repo, parser: PARSER, now: Date.parse("2026-06-30T12:00:00Z") }).findings;
+      assert.deepEqual(found.map(f => f.severity), ["medium"]);
+      assert.match(found[0].message, /column 12: "Be helpful\.\\u\{200B\}".*Approved by mona until 2026-06-30: zero-width joiner kept on purpose$/);
+      assert.deepEqual(levels(approvedBase, approvedHead, Date.parse("2026-07-01")), [`${APPROVALS_PATH}:approvals:medium`, "AGENTS.md:unicode:high"]);
+      const noteBase = commit({ "docs/note.md": `intro\r\n${line}\r`, [APPROVALS_PATH]: approvals }, "renamed", base);
+      run("mv", "docs/note.md", "AGENTS.md");
+      const renamed = commit({});
+      assert.deepEqual(levels(noteBase, renamed, Date.parse("2026-01-01")), ["AGENTS.md:unicode:medium"]);
+      assert.deepEqual(levels(noteBase, renamed, Date.parse("2026-07-01")), [`${APPROVALS_PATH}:approvals:medium`, "AGENTS.md:unicode:high"]);
+      run("mv", "AGENTS.md", "docs/other.md");
+      assert.deepEqual(levels(renamed, commit({}), Date.parse("2026-01-01")), []);
+    } finally {
+      run("checkout", "-q", "main");
+    }
+  });
+});
+
+describe("hidden-text policy", () => {
+  const now = Date.parse("2026-01-01");
+  const good = { path: "AGENTS.md", sha256: lineHash("x"), reviewer: "mona", reason: "ok", expires: "2026-01-01" };
+  test("parseApprovals keeps complete, unexpired entries and counts the rest", () => {
+    assert.deepEqual(parseApprovals(null, now), { approvals: [], ignored: 0 });
+    assert.deepEqual(parseApprovals("{", now), { approvals: [], ignored: 1 });
+    assert.deepEqual(parseApprovals('{"approvals":{}}', now), { approvals: [], ignored: 1 });
+    const bad = [{ ...good, sha256: "ABC" }, { ...good, reviewer: "-x y" }, { ...good, reason: " " }, { ...good, expires: "2025-12-31" }, { ...good, expires: "2026-02-30" }, { ...good, expires: "2026-02-30x" }, null];
+    assert.deepEqual(parseApprovals(JSON.stringify({ approvals: [good, ...bad] }), now), { approvals: [good], ignored: bad.length });
+  });
+  test("only hidden-text findings in agent files are judged, and only an approval for the same path and line counts", () => {
+    const file = path => ({ path, added: [{ line: 1, text: "x" }] });
+    const f = (path, rule) => ({ rule, severity: "medium", path, line: 1, message: "m." });
+    assert.deepEqual(applyHiddenPolicy([f("docs/a.md", "hidden-comment")], file("docs/a.md"), [good]).map(x => x.severity), ["medium"]);
+    assert.deepEqual(applyHiddenPolicy([f("AGENTS.md", "frontmatter")], file("AGENTS.md"), []).map(x => x.severity), ["medium"]);
+    for (const path of [".github/aw/x.md", "a/b/SKILL.md", "pkg/AGENTS.md"]) assert.equal(applyHiddenPolicy([f(path, "unicode")], file(path), [good])[0].severity, "high", path);
+    assert.equal(applyHiddenPolicy([f("AGENTS.md", "lookalike")], file("AGENTS.md"), [good])[0].severity, "medium");
+    assert.equal(applyHiddenPolicy([f("AGENTS.md", "lookalike")], { path: "AGENTS.md", added: [{ line: 1, text: "y" }] }, [good])[0].severity, "high");
+  });
+  test("excerpt escapes everything outside printable ASCII and counts columns in code points", () => {
+    assert.equal(excerpt("a\u{E0041}b\u202Ec", 3), 'column 3: "a\\u{E0041}b\\u{202E}c"');
+    assert.equal(excerpt(`${"x".repeat(40)}\u200B`, 40), `column 41: "${"x".repeat(24)}\\u{200B}"`);
   });
 });

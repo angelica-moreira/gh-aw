@@ -6,8 +6,8 @@ const DOC_EXT = /\.mdx?$/i;
 // U+E0000-E007F, U+00AD, U+034F, U+200B-200F, U+2060-2064 and U+FEFF. The gate adds the
 // variation selectors (U+FE00-FE0E, U+E0100-E01EF) and the fillers U+115F, U+1160, U+180E,
 // U+3164 and U+FFA0, which also render as nothing. U+FE0F (emoji style) is left alone.
-const BIDI = /[\u202A-\u202E\u2066-\u2069]/u;
-const TAG = /[\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/u;
+// Bidi controls, tag characters and the supplementary variation selectors.
+const STRONG = /[\u202A-\u202E\u2066-\u2069\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
 const INVISIBLE = /[\u00AD\u034F\u115F\u1160\u180E\u200B-\u200F\u2060-\u2064\u3164\uFE00-\uFE0E\uFEFF\uFFA0]/gu;
 const PICTO = /\p{Extended_Pictographic}/u;
 const EMOJI_PART = /[\p{Extended_Pictographic}\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
@@ -31,18 +31,28 @@ function isEmojiJoiner(text, index) {
 }
 
 function hiddenChars(text) {
-  return [...text.matchAll(INVISIBLE)].filter(m => !isEmojiJoiner(text, m.index)).map(m => m[0]);
+  return [...text.matchAll(INVISIBLE)].filter(m => !isEmojiJoiner(text, m.index));
 }
 
 function codepoints(chars) {
   return [...new Set(chars)].map(ch => `U+${ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0")}`).join(", ");
 }
 
+const SPAN = 24;
+const escapeChar = ch => (/^[\x20-\x7E]$/.test(ch) ? ch : `\\u{${ch.codePointAt(0).toString(16).toUpperCase()}}`);
+
+/** The text around `index`, with every character outside printable ASCII written as \u{...}, so reviewers see what is there. */
+export function excerpt(text, index) {
+  const chars = [...text];
+  const at = [...text.slice(0, index)].length;
+  return `column ${at + 1}: "${chars.slice(Math.max(0, at - SPAN), at + SPAN).map(escapeChar).join("")}"`;
+}
+
 function unicodeFinding(path, { line, text }) {
-  const strong = [...text].filter(ch => BIDI.test(ch) || TAG.test(ch));
-  if (strong.length) return finding("unicode", "high", path, line, `bidi, tag or variation selector characters ${codepoints(strong)} can hide text from reviewers.`);
+  const strong = [...text.matchAll(STRONG)];
+  if (strong.length) return finding("unicode", "high", path, line, `bidi, tag or variation selector characters ${codepoints(strong.map(m => m[0]))} can hide text from reviewers, at ${excerpt(text, strong[0].index)}.`);
   const weak = hiddenChars(text);
-  if (weak.length) return finding("unicode", "medium", path, line, `invisible characters ${codepoints(weak)}.`);
+  if (weak.length) return finding("unicode", "medium", path, line, `invisible characters ${codepoints(weak.map(m => m[0]))}, at ${excerpt(text, weak[0].index)}.`);
   return null;
 }
 
@@ -56,9 +66,9 @@ const OTHER_SCRIPT = /[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}]/u
 const isSpoof = word => LATIN.test(word) && [...word].every(ch => !OTHER_SCRIPT.test(ch) || HOMOGLYPH.test(ch)) && HOMOGLYPH.test(word);
 
 function lookalikeFinding(path, { line, text }) {
-  const word = text.match(WORD)?.find(isSpoof);
+  const word = [...text.matchAll(WORD)].find(m => isSpoof(m[0]));
   if (!word) return null;
-  return finding("lookalike", "high", path, line, `"${word}" mixes Latin letters with look-alike letters from another alphabet ${codepoints([...word].filter(ch => HOMOGLYPH.test(ch)))}.`);
+  return finding("lookalike", "high", path, line, `"${word[0]}" mixes Latin letters with look-alike letters from another alphabet ${codepoints([...word[0]].filter(ch => HOMOGLYPH.test(ch)))}, at ${excerpt(text, word.index)}.`);
 }
 
 export function scanUnicode(file) {
@@ -114,7 +124,7 @@ export function commentLines(content) {
 export function scanHiddenComments(file, content) {
   const hidden = commentLines(content);
   return docLines(file, content, (added, end) => added.line > end && hidden.has(added.line))
-    .map(added => finding("hidden-comment", "medium", file.path, added.line, "adds text inside a comment that the rendered page hides but an agent reading the file sees; check it holds no instructions."));
+    .map(added => finding("hidden-comment", "medium", file.path, added.line, `adds text inside a comment that the rendered page hides but an agent reading the file sees; check it holds no instructions. Starts at ${excerpt(added.text, 0)}.`));
 }
 
 /** Exported escape*, sanitize* and serialize* functions in `git grep -n <rev>` output, as name -> Set of paths. */

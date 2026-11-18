@@ -23,8 +23,8 @@ export function mutant(text, path, name, parser) {
   return `${text.slice(0, at)} return ${value};${text.slice(at)}`;
 }
 
-// Every folder from the worktree root down to `path` must be a real folder, not a link that code
-// under test planted to send the gate's writes somewhere else.
+// Every folder from the worktree root down to `path` must be a real folder, not a link the change
+// committed to send the gate's writes somewhere else.
 function insideTree(tree, path) {
   const parts = relative(tree, dirname(path)).split(sep).filter(Boolean);
   if (parts.includes("..")) return false;
@@ -35,9 +35,8 @@ function insideTree(tree, path) {
   });
 }
 
-// Removing first means a symlink left by code under test is replaced, never written through.
-function replaceFile(tree, path, data) {
-  if (!insideTree(tree, path)) throw new Error(`a folder above ${path} was replaced by a link, so the gate will not write there`);
+// Removing first means a link in its place is replaced, never written through.
+function replaceFile(path, data) {
   rmSync(path, { force: true });
   writeFileSync(path, data, { flag: "wx" });
 }
@@ -51,39 +50,45 @@ function isPlainFile(path) {
 }
 
 /**
- * "killed" when a test that did not fail unmutated (baseline: test -> status) fails now,
- * "crashed" when the run broke, else "survived".
+ * "killed" when a test that passed unmutated (baseline: test -> status) fails now. "inconclusive"
+ * when the run broke, or a test that passed unmutated did not report pass or fail, since a crash
+ * or a missing result says nothing about whether the tests look at the escaper. Else "survived".
  */
-function outcome(docsDir, sandbox, baseline) {
-  const run = runTests(docsDir, testFiles(docsDir), sandbox);
-  if (run.crashed) return "crashed";
-  return [...run.results].some(([key, status]) => status === "fail" && baseline[key] !== "fail") ? "killed" : "survived";
+export function outcome(results, crashed, baseline) {
+  if (crashed) return "inconclusive";
+  const passed = Object.keys(baseline).filter(key => baseline[key] === "pass");
+  if (passed.some(key => results.get(key) === "fail")) return "killed";
+  return passed.every(key => results.get(key) === "pass") ? "survived" : "inconclusive";
 }
 
 /**
- * Runs the docs tests of `tree` with one escaper broken, then puts the file back. "skipped" when
- * it cannot be broken, "no-baseline" when the unmutated tests (baseline) crashed.
+ * Breaks one escaper in a fresh workspace from `open()` ({ tree, sandbox, dispose }) and runs its
+ * docs tests there. The workspace is thrown away after, so nothing has to be put back after code
+ * under test ran. "skipped" when it cannot be broken, "no-baseline" when the unmutated tests crashed.
  */
-export function tryMutant(tree, { name, file }, { parser, sandbox, baseline }) {
+export function tryMutant(open, { name, file }, { parser, baseline }) {
   if (baseline.crashed) return "no-baseline";
-  const path = join(tree, file);
-  if (!insideTree(tree, path) || !isPlainFile(path)) return "skipped";
-  const original = readFileSync(path);
-  const text = mutant(original.toString("utf8"), file, name, parser);
-  if (text === null) return "skipped";
-  replaceFile(tree, path, text);
+  const { tree, sandbox, dispose } = open();
   try {
-    return outcome(join(tree, "docs"), sandbox, baseline.results);
+    const path = join(tree, file);
+    if (!insideTree(tree, path) || !isPlainFile(path)) return "skipped";
+    const text = mutant(readFileSync(path, "utf8"), file, name, parser);
+    if (text === null) return "skipped";
+    replaceFile(path, text);
+    const docsDir = join(tree, "docs");
+    const run = runTests(docsDir, testFiles(docsDir), sandbox);
+    return outcome(run.results, run.crashed, baseline.results);
   } finally {
-    replaceFile(tree, path, original);
+    dispose();
   }
 }
 
 /**
  * escapers: [{ name, file }] from base. Each is broken in base and in head, one at a time.
+ * workspaces: { base, head } functions that each open a fresh workspace for that revision.
  * tests: the test gate's unmutated results ({ base, head, crashed: { base, head } }).
  */
-export function mutationCheck(trees, escapers, { parser, sandboxes, tests }) {
-  const run = (e, rev) => tryMutant(trees[rev], e, { parser, sandbox: sandboxes[rev], baseline: { results: tests[rev], crashed: tests.crashed[rev] } });
+export function mutationCheck(escapers, { parser, workspaces, tests }) {
+  const run = (e, rev) => tryMutant(workspaces[rev], e, { parser, baseline: { results: tests[rev], crashed: tests.crashed[rev] } });
   return escapers.filter(e => e.file.startsWith(DOCS)).map(e => ({ ...e, base: run(e, "base"), head: run(e, "head") }));
 }

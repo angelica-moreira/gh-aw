@@ -1,7 +1,9 @@
 // node --test reporter: one signed JSON line per finished test, named by its full suite path.
 // Start events arrive in definition order, so a stack indexed by nesting gives each test's ancestors.
-// The gate sends a one-time key on stdin. The runner loads this reporter once, before it starts any
-// test process, so test code never sees the key and cannot sign a line of its own.
+// The gate sends a one-time key on stdin and this reporter reads it before any test process starts,
+// so lines a test prints cannot carry a valid signature. Test code that reads the runner's memory
+// could still find the key, and code under test can change its own results anyway, so test results
+// are evidence; the JSON-LD and browser checks the gate runs itself decide the escaper verdict.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 
