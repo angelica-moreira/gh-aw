@@ -252,6 +252,8 @@ const filteredHead = head
 
 <link rel="icon" type="image/svg+xml" href="/gh-aw/favicon.svg" />
 
+<script type="application/ld+json" set:html={JSON.stringify({ '@context': 'https://schema.org', '@type': 'WebPage', name: rawPageTitle, description: pageDescription })} />
+
 <!-- Responsive tables enhancement script -->
 <script>
   import '../scripts/responsive-tables.ts';
