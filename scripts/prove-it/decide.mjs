@@ -1,8 +1,10 @@
 // Turns stage results into a pass/block decision and a plain-language summary.
 
+const location = f => (f.line ? `${f.path}:${f.line}` : f.path);
+
 function scanReasons(scan) {
   const high = scan.findings.filter(f => f.severity === "high");
-  const reasons = high.map(f => ({ level: "block", text: `${f.path}:${f.line}: ${f.message}` }));
+  const reasons = high.map(f => ({ level: "block", text: `${location(f)}: ${f.message}` }));
   const medium = scan.findings.length - high.length;
   if (medium) reasons.push({ level: "warn", text: `${medium} lower-risk finding(s); see the table below.` });
   return reasons;
@@ -21,11 +23,15 @@ const inconclusive = side => side.verdict === "inconclusive";
 /** Compares runs page by page; a failed head can't show that pages stopped running script. */
 function pageReasons(base, head) {
   const added = morePages(head, base);
+  const before = runsByPage(base);
+  const fresh = added.filter(page => !before.get(page));
+  const worse = added.filter(page => before.get(page));
   const kept = (head.pages ?? []).filter(page => !added.includes(page));
   const fixed = inconclusive(head) ? [] : (base.pages ?? []).filter(page => !(head.pages ?? []).includes(page));
   const reasons = [];
-  if (added.length) reasons.push({ level: "block", text: `This change lets attack strings run as script on ${added.length} more page(s): ${added.join(", ")}.` });
-  if (kept.length) reasons.push({ level: "warn", text: `Attack strings already ran as script before this change on ${kept.length} page(s). Not caused by this change.` });
+  if (fresh.length) reasons.push({ level: "block", text: `This change lets attack strings run as script on ${fresh.length} page(s) where they did not run before: ${fresh.join(", ")}.` });
+  if (worse.length) reasons.push({ level: "block", text: `This change makes attack strings run more times on ${worse.length} page(s) where they already ran: ${worse.join(", ")}.` });
+  if (kept.length) reasons.push({ level: "warn", text: `Attack strings already ran as script before this change on ${kept.length} page(s), and do not run more often now. Not caused by this change.` });
   if (fixed.length) reasons.push({ level: "info", text: `This change stops attack strings from running on ${fixed.length} page(s).` });
   return reasons;
 }
@@ -54,6 +60,7 @@ function testReasons(tests) {
   const reasons = [];
   if (crashed.head) reasons.push({ level: "block", text: "The docs tests could not run after this change (see logs.head in run.json)." });
   if (crashed.base) reasons.push({ level: "warn", text: "The docs tests could not run before this change, so there is nothing to compare against." });
+  if (tests.replacedTests?.length) reasons.push({ level: "warn", text: `This change edits existing test files; the gate ran the version from before the change instead: ${tests.replacedTests.join(", ")}.` });
   reasons.push(...compare.missing.map(t => ({ level: "block", text: `Test passed before and is missing now: ${t}` })));
   reasons.push(...compare.newFailures.map(t => ({ level: "block", text: `New test fails: ${t}` })));
   for (const r of rechecks) {
@@ -80,7 +87,7 @@ const cell = text => plain(text).replaceAll("|", "\\|");
 
 function findingsTable(findings) {
   if (!findings.length) return ["No findings in the added lines."];
-  const rows = findings.map(f => `| ${f.severity} | ${f.rule} | \`${cell(f.path)}:${f.line}\` | ${cell(f.message)} |`);
+  const rows = findings.map(f => `| ${f.severity} | ${f.rule} | \`${cell(location(f))}\` | ${cell(f.message)} |`);
   return ["| Severity | Rule | Where | What |", "|---|---|---|---|", ...rows];
 }
 
@@ -105,7 +112,7 @@ export function summary(run) {
   return [
     "## Prove-it gate",
     "",
-    `${verdict} for \`${run.base}\`...\`${run.head}\`.`,
+    `${verdict} for \`${run.base}\`...\`${run.head}\`. Code from the change ran ${run.isolation === "docker" ? "in a container with no network" : "without a container"}.`,
     "",
     ...reasons,
     "",
@@ -124,7 +131,7 @@ export function summary(run) {
     "### Reproduce",
     "",
     "```sh",
-    `node scripts/prove-it/gate.mjs run --base ${run.base} --head ${run.head} --out <new-folder>`,
+    `node scripts/prove-it/gate.mjs run --base ${run.base} --head ${run.head} --out <new-folder>${run.isolation === "docker" ? " --isolate docker" : ""}`,
     "```",
     "",
   ].join("\n");

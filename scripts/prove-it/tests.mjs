@@ -1,10 +1,10 @@
 // Test gate: runs the docs node tests at base and head and compares results per test.
-import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
+import { runNode } from "./sandbox.mjs";
 
-// --test-reporter needs a file:// URL; a Windows path such as D:\x is read as scheme "d:".
-const REPORTER = new URL("./reporter.mjs", import.meta.url).href;
+// Passed inline as a data: URL, so the run needs no file from the gate folder and cannot swap it.
+const REPORTER = `data:text/javascript;base64,${readFileSync(new URL("./reporter.mjs", import.meta.url)).toString("base64")}`;
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
 export const RERUNS = 5;
 
@@ -12,6 +12,29 @@ export function testFiles(docsDir) {
   const dir = join(docsDir, "tests");
   if (!existsSync(dir)) return [];
   return readdirSync(dir).filter(name => name.endsWith(".test.mjs")).sort().map(name => `tests/${name}`);
+}
+
+function sameFile(a, b) {
+  return existsSync(b) && readFileSync(a).equals(readFileSync(b));
+}
+
+/**
+ * Copies every file under base docs/tests over head, so a change cannot loosen or delete the
+ * tests it is judged by. New head-only files stay. Returns the files that were replaced.
+ */
+export function useBaseTests(baseDocs, headDocs) {
+  const dir = join(baseDocs, "tests");
+  if (!existsSync(dir)) return [];
+  const replaced = [];
+  for (const entry of readdirSync(dir, { recursive: true, withFileTypes: true }).filter(e => e.isFile())) {
+    const from = join(entry.parentPath, entry.name);
+    const to = join(headDocs, relative(baseDocs, from));
+    if (sameFile(from, to)) continue;
+    mkdirSync(dirname(to), { recursive: true });
+    copyFileSync(from, to);
+    replaced.push(relative(baseDocs, from).replaceAll("\\", "/"));
+  }
+  return replaced.sort();
 }
 
 /**
@@ -38,18 +61,10 @@ export function runCrashed(run, results) {
   return run.status !== 0 && ![...results.values()].includes("fail");
 }
 
-export function runTests(docsDir, files) {
+export function runTests(docsDir, files, sandbox) {
   if (files.length === 0) return { results: new Map(), exitCode: 0, crashed: false, log: "" };
-  // A parent test runner's NODE_TEST_CONTEXT would make the child skip our reporter.
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
-  const run = spawnSync(process.execPath, ["--test", "--test-concurrency=1", `--test-reporter=${REPORTER}`, ...files], {
-    cwd: docsDir,
-    env,
-    encoding: "utf8",
-    timeout: TEST_TIMEOUT_MS,
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  const args = ["--test", "--test-concurrency=1", `--test-reporter=${REPORTER}`, ...files];
+  const run = runNode(args, { cwd: docsDir, sandbox, timeoutMs: TEST_TIMEOUT_MS });
   const results = parseResults(run.stdout ?? "", docsDir);
   return { results, exitCode: run.status, crashed: runCrashed(run, results), log: `${run.stderr ?? ""}${run.error ? String(run.error) : ""}`.slice(-4000) };
 }
@@ -73,11 +88,11 @@ export function compareResults(base, head) {
 }
 
 /** Share of reruns where the test passed, or null if any rerun crashed or did not run it. */
-function passRate(docsDir, key, runs) {
+function passRate(docsDir, key, runs, sandbox) {
   const file = key.slice(0, key.indexOf(" > "));
   let passed = 0;
   for (let i = 0; i < runs; i++) {
-    const run = runTests(docsDir, [file]);
+    const run = runTests(docsDir, [file], sandbox);
     const status = run.results.get(key);
     if (run.crashed || (status !== "pass" && status !== "fail")) return null;
     if (status === "pass") passed++;
@@ -92,10 +107,10 @@ export function classifyFlip(baseRate, headRate) {
 }
 
 /** Reruns the whole file of each flipped test, so parent tests and hooks run as they did the first time. */
-export function recheckFlips(flipped, baseDir, headDir, runs = RERUNS) {
+export function recheckFlips(flipped, baseDir, headDir, { runs = RERUNS, sandboxes = {} } = {}) {
   return flipped.map(key => {
-    const baseRate = passRate(baseDir, key, runs);
-    const headRate = passRate(headDir, key, runs);
+    const baseRate = passRate(baseDir, key, runs, sandboxes.base);
+    const headRate = passRate(headDir, key, runs, sandboxes.head);
     return { test: key, baseRate, headRate, kind: classifyFlip(baseRate, headRate) };
   });
 }

@@ -5,20 +5,42 @@ import { createRequire } from "node:module";
 import { extname, join, normalize, sep } from "node:path";
 
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".xml": "application/xml" };
+const REPORT_PATH = "/__prove-it/csp-report";
+const MAX_REPORT_BYTES = 64 * 1024;
 
-// Runs before page scripts: records the call site each time the marker fires.
-const RECORDER = () => {
-  let count = 0;
-  const where = [];
-  Object.defineProperty(globalThis, "__proveIt", {
-    configurable: true,
-    get: () => count,
-    set(value) {
-      count = value;
-      where.push(new Error().stack.split("\n")[2]?.trim() ?? "");
+// Report-only: nothing is blocked, but Chromium itself reports every inline script and event
+// handler about to run, with its first 40 characters. Page code cannot stop these reports.
+export const CSP = `script-src 'self' 'report-sample'; report-uri ${REPORT_PATH}`;
+
+// Runs before page scripts. The marker property cannot be redefined, and each hit is also sent
+// to Node through a binding captured here. Built-ins are captured too, and the hit is counted
+// before anything page code could have tampered with, so later page code cannot hide a hit.
+// `globalThis` is pinned so page code cannot point the attack strings at another object.
+export const RECORDER = ({ marker, binding }) => {
+  const report = globalThis[binding];
+  const E = Error;
+  let hits = 0;
+  Object.defineProperty(globalThis, "globalThis", { value: globalThis, writable: false, configurable: false });
+  // Frames: the Error line, siteOf, the setter, then the code that set the marker.
+  const siteOf = () => {
+    try {
+      return String(new E().stack).split("\n")[3]?.trim() ?? "";
+    } catch {
+      return "";
+    }
+  };
+  Object.defineProperty(globalThis, marker, {
+    configurable: false,
+    get: () => hits,
+    set() {
+      hits++;
+      try {
+        report(siteOf());
+      } catch {
+        report("");
+      }
     },
   });
-  globalThis.__proveItWhere = where;
 };
 
 /** Maps a URL path under `base` to a file under `dir`, refusing anything outside it. */
@@ -33,26 +55,74 @@ async function respond(res, file) {
   try {
     const info = await stat(file);
     const path = info.isDirectory() ? join(file, "index.html") : file;
-    res.writeHead(200, { "content-type": TYPES[extname(path)] ?? "application/octet-stream" });
+    res.writeHead(200, { "content-type": TYPES[extname(path)] ?? "application/octet-stream", "content-security-policy-report-only": CSP });
     res.end(await readFile(path));
   } catch {
     res.writeHead(404).end();
   }
 }
 
+const isOptional = (value, type) => value === undefined || typeof value === type;
+
+// Keeps only the fields takeReports reads, and only when they have the types Chromium sends.
+function validReport(report) {
+  if (typeof report?.["document-uri"] !== "string") return null;
+  const { "document-uri": uri, "script-sample": sample, "line-number": line, "column-number": column } = report;
+  if (!isOptional(sample, "string") || !isOptional(line, "number") || !isOptional(column, "number")) return null;
+  return { "document-uri": uri, "script-sample": sample, "line-number": line, "column-number": column };
+}
+
+function collectReport(req, res, reports) {
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", chunk => {
+    body += chunk;
+    if (body.length > MAX_REPORT_BYTES) req.destroy();
+  });
+  req.on("end", () => {
+    try {
+      const report = validReport(JSON.parse(body)?.["csp-report"]);
+      if (report) reports.push(report);
+    } catch {}
+    res.writeHead(204).end();
+  });
+}
+
+/** Serves dir under base. `reports` collects the CSP reports Chromium sends for pages it loaded. */
 export async function serve(dir, base, extra = {}) {
   const root = normalize(dir);
+  const reports = [];
   const server = createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
-    if (extra[url.pathname]) return res.writeHead(200, { "content-type": "text/html" }).end(extra[url.pathname]);
+    if (req.method === "POST" && url.pathname === REPORT_PATH) return collectReport(req, res, reports);
+    if (extra[url.pathname]) return res.writeHead(200, { "content-type": "text/html", "content-security-policy-report-only": CSP }).end(extra[url.pathname]);
     const file = filePathFor(url.pathname, base, root);
     return file ? respond(res, file) : res.writeHead(404).end();
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  return { origin: `http://127.0.0.1:${server.address().port}`, close: () => new Promise(resolve => server.close(resolve)) };
+  return { origin: `http://127.0.0.1:${server.address().port}`, reports, close: () => new Promise(resolve => server.close(resolve)) };
 }
 
-function readPage() {
+/**
+ * Takes the reports for `url` out of `reports` and returns the distinct places where a script
+ * holding the marker was about to run. Chromium also sends a copy without a location for some
+ * event handlers; that copy only counts when no located report exists.
+ */
+export function takeReports(reports, url, marker) {
+  const sites = new Set();
+  let unlocated = false;
+  for (let i = reports.length - 1; i >= 0; i--) {
+    const report = reports[i];
+    if (report["document-uri"] !== url) continue;
+    reports.splice(i, 1);
+    if (!String(report["script-sample"] ?? "").includes(marker)) continue;
+    if (report["line-number"]) sites.add(`csp ${url}:${report["line-number"]}:${report["column-number"]}`);
+    else unlocated = true;
+  }
+  return sites.size || !unlocated ? [...sites].reverse() : [`csp ${url}`];
+}
+
+function readPage(marker) {
   const blocks = [...document.querySelectorAll('script[type="application/ld+json"]')].map(s => s.textContent ?? "");
   const broken = blocks.filter(text => {
     try {
@@ -62,28 +132,38 @@ function readPage() {
       return true;
     }
   });
-  return { runs: globalThis.__proveIt ?? 0, where: globalThis.__proveItWhere ?? [], ldJson: blocks.length, ldJsonBroken: broken.length };
+  return { runs: globalThis[marker] ?? 0, ldJson: blocks.length, ldJsonBroken: broken.length };
 }
 
-export async function inspect(context, url) {
+const SETTLE_MS = 500;
+
+async function visit(context, url, { marker, hits, reports }) {
   const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: "load", timeout: 30_000 });
-    await page.waitForTimeout(150);
-    return await page.evaluate(readPage);
+    await page.waitForTimeout(SETTLE_MS);
+    const seen = await page.evaluate(readPage, marker);
+    const where = hits.get(page) ?? [];
+    const reported = takeReports(reports, page.url(), marker);
+    return { ...seen, runs: Math.max(seen.runs, where.length, reported.length), recorded: where.length, reported: reported.length, where: where.length ? where : reported };
   } finally {
     await page.close();
+    hits.delete(page);
   }
 }
 
-export async function withBrowser(docsDir, origin, fn) {
-  const { chromium } = createRequire(join(docsDir, "package.json"))("playwright");
+/** Opens Chromium with the recorder installed and gives `fn` a `visit(url)` helper. */
+export async function withBrowser({ nodeModules, origin, marker, reports }, fn) {
+  const { chromium } = createRequire(join(nodeModules, "..", "package.json"))("playwright");
   const browser = await chromium.launch();
   try {
     const context = await browser.newContext();
-    await context.addInitScript(RECORDER);
+    const binding = `${marker}r`;
+    const hits = new Map();
+    await context.exposeBinding(binding, ({ page }, site) => hits.set(page, [...(hits.get(page) ?? []), String(site)]));
+    await context.addInitScript(RECORDER, { marker, binding });
     await context.route("**/*", route => (route.request().url().startsWith(origin) ? route.continue() : route.abort()));
-    return await fn(context);
+    return await fn(url => visit(context, url, { marker, hits, reports }));
   } finally {
     await browser.close();
   }
